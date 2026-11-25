@@ -22,7 +22,7 @@ calamine = "0.38"
 # Same version calamine pulls in. Used only to measure XLSX decompressed size before calamine reads it.
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
 # record API only: no `arrow` feature, so no arrow types in the public API.
-parquet = { version = "60.2", default-features = false, features = ["snap", "flate2-zlib-rs", "lz4"] }
+parquet = { version = "60.2", default-features = false, features = ["snap", "flate2-zlib-rs", "lz4", "brotli"] }
 
 [dev-dependencies]
 # Pinned: the conformance tests call only `spine_rules::composite_key`

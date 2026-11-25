@@ -7,64 +7,13 @@ mod common;
 
 use cmdrvl_tabular::{Cell, CellClass, OpenOptions, RefusalCode, open};
 use common::*;
-use serde_json::{Value, json};
-
-struct Expected {
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
-}
-
-fn expected(name: &str) -> Expected {
-    let v: Value = serde_json::from_slice(&std::fs::read(fx(name)).unwrap()).unwrap();
-    let strings = |v: &Value| -> Vec<String> {
-        v.as_array()
-            .unwrap()
-            .iter()
-            .map(|s| s.as_str().unwrap().to_owned())
-            .collect()
-    };
-    Expected {
-        headers: strings(&v["headers"]),
-        rows: v["rows"].as_array().unwrap().iter().map(strings).collect(),
-    }
-}
-
-fn cell_text(cell: &Cell) -> String {
-    String::from_utf8(cell.as_bytes().to_vec()).unwrap()
-}
-
-fn assert_matches(file: &str, expected_file: &str, opts: &OpenOptions) {
-    let want = expected(expected_file);
-    let mut table = open(&fx(file), opts).unwrap_or_else(|e| panic!("{file}: {e}"));
-    let (headers, rows) = grid(&mut table);
-    let headers: Vec<String> = headers
-        .iter()
-        .map(|h| String::from_utf8(h.clone()).unwrap())
-        .collect();
-    assert_eq!(headers, want.headers, "{file} headers");
-    assert_eq!(rows.len(), want.rows.len(), "{file} row count");
-    for (r, (got, want_row)) in rows.iter().zip(&want.rows).enumerate() {
-        for (c, (cell, want_text)) in got.iter().zip(want_row).enumerate() {
-            let want_cell = Cell::from_bytes(want_text.as_bytes());
-            assert_eq!(
-                cell,
-                &want_cell,
-                "{file} row {} col {} ({}): got {:?}, want {:?}",
-                r + 1,
-                c,
-                want.headers[c],
-                cell_text(cell),
-                want_text
-            );
-        }
-    }
-}
+use serde_json::json;
 
 // ---- Parquet --------------------------------------------------------------
 
 #[test]
 fn parquet_temporal_and_decimal_columns_render_canonically() {
-    assert_matches(
+    assert_grid_matches(
         "temporal.parquet",
         "temporal.parquet.expected.json",
         &OpenOptions::default(),
@@ -127,12 +76,12 @@ fn parquet_single_date_column_renders_instead_of_refusing() {
 
 #[test]
 fn xlsx_dates_datetimes_and_times_render_canonically() {
-    assert_matches("temporal.xlsx", "temporal.xlsx.expected.json", &sheet("t"));
+    assert_grid_matches("temporal.xlsx", "temporal.xlsx.expected.json", &sheet("t"));
 }
 
 #[test]
 fn xlsx_1904_date_system_renders_the_same_dates() {
-    assert_matches(
+    assert_grid_matches(
         "temporal_1904.xlsx",
         "temporal_1904.xlsx.expected.json",
         &sheet("t"),
