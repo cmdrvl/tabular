@@ -1,0 +1,460 @@
+[
+  {
+    "file": "ambiguous_old.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "refused",
+      "code": "E_DIALECT",
+      "candidates": [
+        "0x2c",
+        "0x3b"
+      ]
+    }
+  },
+  {
+    "file": "ambiguous_old.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 2
+    }
+  },
+  {
+    "file": "annex_new.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 4
+    }
+  },
+  {
+    "file": "annex_new.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 4
+    }
+  },
+  {
+    "file": "annex_old.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 4
+    }
+  },
+  {
+    "file": "annex_old.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 4
+    }
+  },
+  {
+    "file": "basic_new.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "basic_new.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "basic_old.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "basic_old.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "dialect_ambiguous.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "refused",
+      "code": "E_DIALECT",
+      "candidates": [
+        "0x2c",
+        "0x3b"
+      ]
+    }
+  },
+  {
+    "file": "dialect_ambiguous.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 2
+    }
+  },
+  {
+    "file": "dup_key_new.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "dup_key_new.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "dup_key_old.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "dup_key_old.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "edge_backslash_escape.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 2
+    }
+  },
+  {
+    "file": "edge_backslash_escape.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 2
+    }
+  },
+  {
+    "file": "edge_backslash_needs_fallback.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 2
+    }
+  },
+  {
+    "file": "edge_backslash_needs_fallback.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 2
+    }
+  },
+  {
+    "file": "edge_bom_sep.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 2
+    }
+  },
+  {
+    "file": "edge_bom_sep.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 2
+    }
+  },
+  {
+    "file": "edge_nul_after_8k.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 2
+    }
+  },
+  {
+    "file": "edge_nul_after_8k.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 2
+    }
+  },
+  {
+    "file": "edge_nul_before_8k.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "refused",
+      "code": "E_ENCODING",
+      "candidates": null
+    }
+  },
+  {
+    "file": "edge_nul_before_8k.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "refused",
+      "code": "E_ENCODING",
+      "candidates": null
+    }
+  },
+  {
+    "file": "edge_sep_crlf.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": "|",
+      "headers": 2
+    }
+  },
+  {
+    "file": "edge_sep_crlf.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 1
+    }
+  },
+  {
+    "file": "edge_sep_semicolon.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ";",
+      "headers": 2
+    }
+  },
+  {
+    "file": "edge_sep_semicolon.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 1
+    }
+  },
+  {
+    "file": "edge_sep_unsupported_byte.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "refused",
+      "code": "E_DIALECT",
+      "candidates": [
+        "0x09"
+      ]
+    }
+  },
+  {
+    "file": "edge_sep_unsupported_byte.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "refused",
+      "code": "E_CSV_PARSE",
+      "candidates": null
+    }
+  },
+  {
+    "file": "edge_straddle_64k.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 2
+    }
+  },
+  {
+    "file": "edge_straddle_64k.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 2
+    }
+  },
+  {
+    "file": "empty.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "empty.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "no_header.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "refused",
+      "code": "E_HEADERS",
+      "candidates": null
+    }
+  },
+  {
+    "file": "no_header.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "refused",
+      "code": "E_HEADERS",
+      "candidates": null
+    }
+  },
+  {
+    "file": "rent_roll_new.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 4
+    }
+  },
+  {
+    "file": "rent_roll_new.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 4
+    }
+  },
+  {
+    "file": "rent_roll_old.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 4
+    }
+  },
+  {
+    "file": "rent_roll_old.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 4
+    }
+  },
+  {
+    "file": "schema_drift_new.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "schema_drift_new.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "schema_drift_old.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "schema_drift_old.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "type_shift_new.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "type_shift_new.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "type_shift_old.csv",
+    "forced_delimiter": null,
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  },
+  {
+    "file": "type_shift_old.csv",
+    "forced_delimiter": ",",
+    "shape": {
+      "outcome": "ok",
+      "delimiter": ",",
+      "headers": 3
+    }
+  }
+]

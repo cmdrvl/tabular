@@ -12,7 +12,7 @@ use std::path::Path;
 
 use crate::detect::check_text_sample;
 use crate::refusal::{Refusal, RefusalCode};
-use crate::{Cell, CsvOptions, Format, Opened, Row, missing_headers};
+use crate::{Cell, CsvOptions, Format, Opened, Row, RowStream, missing_headers};
 
 const CANDIDATE_DELIMITERS: [u8; 5] = *b",\t;|^";
 const SAMPLE_BYTES: usize = 64 * 1024;
@@ -69,39 +69,80 @@ pub(crate) fn open(path: &Path, format: Format, opts: &CsvOptions) -> Result<Ope
         }
     }
 
-    let mut sample = read_sample(&mut file, body_offset)?;
+    let sample = read_sample(&mut file, body_offset)?;
     if sample.is_empty() {
         return Err(missing_headers());
     }
     check_text_sample(&sample)?;
-    if body_offset + sample.len() as u64 >= file_len {
-        // whole remainder fits in the sample
-    } else if let Some(last_newline) = sample.iter().rposition(|&b| b == b'\n') {
-        // Avoid probing a record cut in half by the sample boundary.
-        sample.truncate(last_newline + 1);
-    }
 
+    // Same precedence as shape: a pinned delimiter, then an Excel `sep=<byte>` first line,
+    // then auto-detection. A pinned or `sep=` delimiter tries RFC 4180 quoting first and
+    // falls back to backslash escaping if the header or first record will not parse;
+    // an auto-detected dialect already carries its escape mode.
     let pinned = opts.delimiter.or(if format == Format::Tsv {
         Some(b'\t')
     } else {
         None
     });
-    let dialect = match pinned {
-        Some(delimiter) => Dialect {
+    let sep = sep_directive(&sample);
+    let (delimiter, consumed, modes): (u8, u64, &[Escape]) = if let Some(delimiter) = pinned {
+        (
             delimiter,
-            escape: Escape::None,
-        },
-        None => detect(&sample)?,
+            sep.map_or(0, |s| s.consumed),
+            &[Escape::None, Escape::Backslash],
+        )
+    } else if let Some(sep) = sep {
+        (
+            sep.delimiter,
+            sep.consumed,
+            &[Escape::None, Escape::Backslash],
+        )
+    } else {
+        let dialect = detect_dialect(path, &sample, body_offset, file_len)?;
+        let modes: &[Escape] = match dialect.escape {
+            Escape::None => &[Escape::None],
+            Escape::Backslash => &[Escape::Backslash],
+        };
+        (dialect.delimiter, 0, modes)
     };
 
-    file.seek(SeekFrom::Start(body_offset))
+    for (attempt, escape) in modes.iter().enumerate() {
+        match start(path, body_offset + consumed, delimiter, *escape) {
+            Ok((headers, rows)) => {
+                return Ok(Opened {
+                    headers,
+                    rows,
+                    delimiter: Some(delimiter),
+                    sheet: None,
+                });
+            }
+            Err(refusal) if attempt + 1 < modes.len() && refusal.code == RefusalCode::ECsvParse => {
+                continue;
+            }
+            Err(refusal) => return Err(refusal),
+        }
+    }
+    Err(missing_headers())
+}
+
+/// Open the body at `offset`, read the header and probe the first data record (a parse
+/// error there is reported now, so the escape fallback can react), and return the headers
+/// plus a lazy stream that starts with that first record.
+fn start(
+    path: &Path,
+    offset: u64,
+    delimiter: u8,
+    escape: Escape,
+) -> Result<(Vec<Vec<u8>>, RowStream), Refusal> {
+    let mut file = File::open(path).map_err(|e| Refusal::io(&e))?;
+    file.seek(SeekFrom::Start(offset))
         .map_err(|e| Refusal::io(&e))?;
     let mut builder = csv::ReaderBuilder::new();
     builder
         .has_headers(false)
         .flexible(false)
-        .delimiter(dialect.delimiter)
-        .escape(match dialect.escape {
+        .delimiter(delimiter)
+        .escape(match escape {
             Escape::None => None,
             Escape::Backslash => Some(b'\\'),
         });
@@ -113,9 +154,13 @@ pub(crate) fn open(path: &Path, format: Format, opts: &CsvOptions) -> Result<Ope
         Some(Err(error)) => return Err(csv_refusal(&error)),
         None => return Err(missing_headers()),
     };
+    let first = match records.next() {
+        Some(Err(error)) => return Err(csv_refusal(&error)),
+        other => other,
+    };
 
     let mut index = 0u64;
-    let rows = records.map(move |record| {
+    let rows = first.into_iter().chain(records).map(move |record| {
         let record = record.map_err(|e| csv_refusal(&e))?;
         index += 1;
         Ok(Row {
@@ -123,11 +168,39 @@ pub(crate) fn open(path: &Path, format: Format, opts: &CsvOptions) -> Result<Ope
             cells: record.iter().map(Cell::from_bytes).collect(),
         })
     });
-    Ok(Opened {
-        headers,
-        rows: Box::new(rows),
-        delimiter: Some(dialect.delimiter),
-        sheet: None,
+    Ok((headers, Box::new(rows)))
+}
+
+/// An Excel `sep=<byte>` first line, exactly as shape reads it: five bytes (an optional
+/// `\r` before the newline is ignored), a supported delimiter byte.
+#[derive(Clone, Copy)]
+struct Sep {
+    delimiter: u8,
+    consumed: u64,
+}
+
+fn sep_directive(sample: &[u8]) -> Option<Sep> {
+    let line_end = sample
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(sample.len());
+    let consumed = if line_end < sample.len() {
+        line_end + 1
+    } else {
+        line_end
+    };
+    let mut line = &sample[..line_end];
+    if line.last() == Some(&b'\r') {
+        line = &line[..line.len() - 1];
+    }
+    if line.len() != 5 || !line.starts_with(b"sep=") {
+        return None;
+    }
+    let delimiter = line[4];
+    let supported = delimiter.is_ascii() && !matches!(delimiter, b'"' | b'\n' | b'\r' | 0 | 0x7f);
+    supported.then_some(Sep {
+        delimiter,
+        consumed: consumed as u64,
     })
 }
 
@@ -171,14 +244,38 @@ fn csv_refusal(error: &csv::Error) -> Refusal {
     }
 }
 
-fn detect(sample: &[u8]) -> Result<Dialect, Refusal> {
-    let probes: Vec<Probe> = CANDIDATE_DELIMITERS
-        .iter()
-        .filter_map(|&delimiter| {
-            probe(sample, delimiter, Escape::None)
-                .or_else(|| probe(sample, delimiter, Escape::Backslash))
-        })
-        .collect();
+/// shape's detection flow: score the first 64 KiB (cut mid-record or not); if that does
+/// not yield a dialect and the file is longer, score the first records of the WHOLE file
+/// instead. Only the first 200 records are ever parsed, so the fallback streams the file
+/// rather than loading it.
+fn detect_dialect(
+    path: &Path,
+    sample: &[u8],
+    body_offset: u64,
+    file_len: u64,
+) -> Result<Dialect, Refusal> {
+    match detect(&|| Ok(Box::new(sample))) {
+        Err(_) if body_offset + (sample.len() as u64) < file_len => detect(&|| {
+            let mut file = File::open(path).map_err(|e| Refusal::io(&e))?;
+            file.seek(SeekFrom::Start(body_offset))
+                .map_err(|e| Refusal::io(&e))?;
+            Ok(Box::new(BufReader::new(file)))
+        }),
+        other => other,
+    }
+}
+
+type MakeReader<'a> = &'a dyn Fn() -> Result<Box<dyn Read + 'a>, Refusal>;
+
+fn detect(make: MakeReader<'_>) -> Result<Dialect, Refusal> {
+    let mut probes: Vec<Probe> = Vec::new();
+    for &delimiter in &CANDIDATE_DELIMITERS {
+        let found = match probe(make()?, delimiter, Escape::None) {
+            Some(p) => Some(p),
+            None => probe(make()?, delimiter, Escape::Backslash),
+        };
+        probes.extend(found);
+    }
     let all_candidates = || {
         CANDIDATE_DELIMITERS
             .iter()
@@ -214,7 +311,7 @@ fn hex(byte: u8) -> String {
     format!("0x{byte:02x}")
 }
 
-fn probe(sample: &[u8], delimiter: u8, escape: Escape) -> Option<Probe> {
+fn probe(source: Box<dyn Read + '_>, delimiter: u8, escape: Escape) -> Option<Probe> {
     let mut builder = csv::ReaderBuilder::new();
     builder
         .has_headers(false)
@@ -223,7 +320,7 @@ fn probe(sample: &[u8], delimiter: u8, escape: Escape) -> Option<Probe> {
             Escape::None => None,
             Escape::Backslash => Some(b'\\'),
         });
-    let mut reader = builder.from_reader(sample);
+    let mut reader = builder.from_reader(source);
     let mut histogram: BTreeMap<u64, u64> = BTreeMap::new();
     let mut parsed = 0u64;
     let mut projection = Vec::new();

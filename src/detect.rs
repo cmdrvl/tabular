@@ -109,14 +109,18 @@ pub(crate) fn resolve(path: &Path, requested: Option<Format>) -> Result<Format, 
     }
 }
 
+/// NUL bytes are looked for in this many bytes after the BOM, as shape does (8 KiB).
+const NUL_SCAN_BYTES: usize = 8 * 1024;
+
 /// Check a leading sample of a text file. Returns the number of BOM bytes to skip
-/// (3 for UTF-8, else 0). UTF-16/32 BOMs and NUL bytes in the sample refuse
-/// `E_ENCODING`; NULs after the sample pass through as bytes (v0 limit).
+/// (3 for UTF-8, else 0). UTF-16/32 BOMs, and NUL bytes in the first 8 KiB after the BOM
+/// (shape's window), refuse `E_ENCODING`; NULs after that pass through as bytes.
 pub(crate) fn check_text_sample(sample: &[u8]) -> Result<usize, Refusal> {
     let bad_bom = sample.starts_with(&[0xFF, 0xFE])
         || sample.starts_with(&[0xFE, 0xFF])
         || sample.starts_with(&[0x00, 0x00, 0xFE, 0xFF]);
-    if bad_bom || sample.contains(&0) {
+    let after_bom = sample.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(sample);
+    if bad_bom || after_bom.iter().take(NUL_SCAN_BYTES).any(|&b| b == 0) {
         return Err(Refusal::new(
             RefusalCode::EEncoding,
             "unsupported encoding (UTF-16/32 BOM or NUL bytes)",

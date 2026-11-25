@@ -116,13 +116,27 @@ environment variables.
   duration cells and error cells, and the XLSX cases listed under "Temporal and
   decimal values" below. They refuse `E_UNSUPPORTED_VALUE` with the type name and
   coordinates only.
-- **The CSV delimiter detector has not been checked against `shape`.** It is a
-  re-implementation, written from reading `shape`'s source, of the same scoring
-  (candidates `, \t ; | ^`, 64 KiB sample). It was not diffed or run against
-  `shape`. Two consequences of that scoring are tested and accepted: a ragged
-  record inside the first 200 sampled records makes auto-detection refuse
-  `E_DIALECT` (pin `CsvOptions::delimiter` to get the precise `E_CSV_PARSE`), and
-  on very small files a quoted embedded newline can make the wrong delimiter win.
+- **CSV dialect: matches `shape` on the cases tried, including shape's quirks.**
+  The detector follows shape's flow: a pinned delimiter, then an Excel `sep=<byte>`
+  first line (consumed, not a header), then scoring of the first 64 KiB (candidates
+  `, \t ; | ^`, first 200 records), with a retry over the whole file when the
+  prefix does not decide; a pinned or `sep=` delimiter retries with backslash
+  escaping if the header or first record will not parse. It was run against
+  `shape`'s real input pipeline (shape 0.9.0, 40587f3) on shape's own 16 CSV
+  fixtures plus 3,000 generated files (all five delimiters, quoting, embedded
+  newlines, ragged rows, CRLF, BOMs, `sep=` lines, files straddling 64 KiB, stray
+  NULs): 0 disagreements on refusal code, delimiter, header count and `E_DIALECT`
+  candidates, down from 443 of 3,016 before this was reconciled. The generator
+  and comparison harness were a scratch program, not committed; what is committed
+  is `tests/fixtures/shape/` with 25 files (16 of shape's own, 9 edge cases) and
+  `shape.expected.json`, shape's own outcome for each, which `tests/shape_parity.rs`
+  compares to. Two quirks of shape's scoring are therefore also this crate's:
+  a ragged record inside the first 200 sampled records makes auto-detection
+  refuse `E_DIALECT` (pin `CsvOptions::delimiter` to get the precise
+  `E_CSV_PARSE`), and on very small files a quoted embedded newline can make the
+  wrong delimiter win. Differences kept on purpose: `skip_rows` (preamble) exists
+  only here, and a header-only file is `E_EMPTY` from `open` where shape's input
+  layer reports it OK and decides later.
 - **Zip-bomb guard is declared-size only.** `max_uncompressed_bytes` (default 2 GiB)
   sums the sizes the XLSX central directory declares. A lying header cannot add
   output: the `zip` crate (9.x) stops an entry at its declared size and errors,
@@ -130,8 +144,8 @@ environment variables.
   upgrading `zip` should re-run `zip_bomb_lying.xlsx`.
 - JSON numbers beyond i64/u64/f64 precision lose digits; carry exact decimals as
   strings.
-- The text-encoding check looks at the first 64 KiB: UTF-16/32 BOMs and NUL bytes
-  there are refused; later NULs pass through as bytes.
+- The text-encoding check refuses UTF-16/32 BOMs and NUL bytes within the first
+  8 KiB after the BOM (shape's window); later NULs pass through as bytes.
 
 ## Not verified
 
@@ -146,7 +160,7 @@ time.
 cargo test
 ```
 
-Runs 9 unit tests, 9 cross-format conformance tests, 35 refusal/edge tests, 8
+Runs 9 unit tests, 9 cross-format conformance tests, 35 refusal/edge tests, 4 shape-parity tests, 8
 streaming tests and 13 temporal/decimal tests.
 The conformance tests read the same dataset as CSV, TSV, JSONL, Parquet and XLSX,
 compare each to a hard-coded expected grid, and check composite-key behaviour with
