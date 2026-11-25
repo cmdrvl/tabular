@@ -13,12 +13,12 @@ use std::path::Path;
 
 use parquet::basic::{LogicalType, TimeUnit};
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::Field;
+use parquet::record::{Field, reader::RowIter};
 
 use crate::cell::{canon_f32, canon_f64};
 use crate::refusal::{Refusal, RefusalCode};
 use crate::temporal::{Unit, date_text, decimal_text, time_text, timestamp_text};
-use crate::{Cell, Row, check_row_limit, missing_headers, no_data_rows};
+use crate::{Cell, Opened, Row, missing_headers, too_many_rows};
 
 fn parse_refusal(detail: &str) -> Refusal {
     // Fixed text only: library errors are not forwarded (they could quote data).
@@ -54,10 +54,7 @@ fn spec_of(field: &parquet::schema::types::Type) -> ColSpec {
     }
 }
 
-pub(crate) fn read(
-    path: &Path,
-    max_rows: Option<u64>,
-) -> Result<(Vec<Vec<u8>>, Vec<Row>), Refusal> {
+pub(crate) fn open(path: &Path, max_rows: Option<u64>) -> Result<Opened, Refusal> {
     let file = File::open(path).map_err(|e| Refusal::io(&e))?;
     let reader = SerializedFileReader::new(file)
         .map_err(|_| parse_refusal("not a readable Parquet file"))?;
@@ -82,28 +79,28 @@ pub(crate) fn read(
         && meta.num_rows() > 0
         && meta.num_rows() as u64 > max
     {
-        check_row_limit(max.saturating_add(1), Some(max))?;
+        return Err(too_many_rows(max));
     }
 
-    let iter = reader
-        .get_row_iter(None)
-        .map_err(|_| parse_refusal("cannot decode Parquet row groups"))?;
-    let mut rows = Vec::new();
-    for row in iter {
+    // Owning row iterator: decodes one row group at a time.
+    let iter = RowIter::from_file_into(Box::new(reader));
+    let mut index = 0u64;
+    let rows = iter.map(move |row| {
         let row = row.map_err(|_| parse_refusal("cannot decode Parquet page"))?;
-        let index = rows.len() as u64 + 1;
-        check_row_limit(index, max_rows)?;
-        let mut cells = Vec::with_capacity(headers.len());
+        index += 1;
+        let mut cells = Vec::with_capacity(specs.len());
         for (position, (name, field)) in row.get_column_iter().enumerate() {
             let spec = specs.get(position).copied().unwrap_or(ColSpec::Plain);
             cells.push(cell(field, spec, name, index)?);
         }
-        rows.push(Row { index, cells });
-    }
-    if rows.is_empty() {
-        return Err(no_data_rows());
-    }
-    Ok((headers, rows))
+        Ok(Row { index, cells })
+    });
+    Ok(Opened {
+        headers,
+        rows: Box::new(rows),
+        delimiter: None,
+        sheet: None,
+    })
 }
 
 fn cell(field: &Field, spec: ColSpec, column: &str, row: u64) -> Result<Cell, Refusal> {

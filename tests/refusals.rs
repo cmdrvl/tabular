@@ -41,8 +41,8 @@ fn unknown_sheet_is_not_found_and_lists_sheets() {
 
 #[test]
 fn sheet_selected_by_index_or_name_and_reported() {
-    let table = open(&fx("sample.xlsx"), &opts_sheet(SheetSel::Index(0))).unwrap();
-    assert_eq!(table.row_count(), 3);
+    let mut table = open(&fx("sample.xlsx"), &opts_sheet(SheetSel::Index(0))).unwrap();
+    assert_eq!(count_rows(&mut table), 3);
     assert_eq!(table.source().sheet.as_deref(), Some("loans"));
     let table = open(&fx("sample.xlsx"), &opts_sheet(SheetSel::parse("notes"))).unwrap_err();
     assert_eq!(table.code, RefusalCode::EEmpty, "notes has a header only");
@@ -101,7 +101,7 @@ fn parquet_nested_list_is_refused() {
 #[test]
 fn jsonl_nested_value_is_refused_without_the_value() {
     let (_d, p) = temp("n.jsonl", b"{\"a\":1}\n{\"a\":{\"secret\":\"hunter2\"}}\n");
-    let r = open(&p, &OpenOptions::default()).unwrap_err();
+    let r = first_refusal(&p, &OpenOptions::default()).expect("nested value must refuse");
     assert_eq!(r.code, RefusalCode::EUnsupportedValue);
     assert_eq!(
         (r.context["column"].clone(), r.context["row"].clone()),
@@ -125,12 +125,16 @@ fn max_rows_boundary_in_every_format() {
             max_rows: Some(3),
             ..opts.clone()
         };
-        assert_eq!(open(&fx(file), &at_limit).unwrap().row_count(), 3, "{file}");
+        assert_eq!(
+            count_rows(&mut open(&fx(file), &at_limit).unwrap()),
+            3,
+            "{file}"
+        );
         let under = OpenOptions {
             max_rows: Some(2),
             ..opts
         };
-        let r = open(&fx(file), &under).unwrap_err();
+        let r = first_refusal(&fx(file), &under).expect("over the limit must refuse");
         assert_eq!(r.code, RefusalCode::ETooLarge, "{file}");
         assert_eq!(r.context["limit"], json!("max_rows"), "{file}");
     }
@@ -178,7 +182,7 @@ fn format_override_still_checks_magic() {
         format: Some(Format::Csv),
         ..OpenOptions::default()
     };
-    assert_eq!(open(&p, &opts).unwrap().row_count(), 1);
+    assert_eq!(count_rows(&mut open(&p, &opts).unwrap()), 1);
     let opts = OpenOptions {
         format: Some(Format::Parquet),
         ..OpenOptions::default()
@@ -200,7 +204,8 @@ fn corrupt_parquet_footer_is_parquet_parse_error() {
 fn csv_with(bytes: &[u8], opts: &OpenOptions) -> Result<Vec<Vec<Cell>>, cmdrvl_tabular::Refusal> {
     let (_d, p) = temp("in.csv", bytes);
     let mut table = open(&p, opts)?;
-    Ok(grid(&mut table).1)
+    // Drain the stream: a refusal anywhere in the file counts, whether `open` or a later row raised it.
+    table.rows().map(|row| row.map(|r| r.cells)).collect()
 }
 
 fn csv_of(bytes: &[u8]) -> Result<Vec<Vec<Cell>>, cmdrvl_tabular::Refusal> {
@@ -222,9 +227,9 @@ fn detects_every_candidate_delimiter() {
     for d in [',', '\t', ';', '|', '^'] {
         let body = format!("a{d}b\n1{d}2\n3{d}4\n");
         let (_dir, p) = temp("in.csv", body.as_bytes());
-        let table = open(&p, &OpenOptions::default()).unwrap();
+        let mut table = open(&p, &OpenOptions::default()).unwrap();
         assert_eq!(table.source().delimiter, Some(d as u8), "{d:?}");
-        assert_eq!(table.row_count(), 2);
+        assert_eq!(count_rows(&mut table), 2);
     }
 }
 
@@ -437,4 +442,67 @@ fn io_refusal_carries_kind_only() {
     assert_eq!(r.code, RefusalCode::EIo);
     assert_eq!(r.context["kind"], json!("NotFound"));
     assert_no_leak(&r, "definitely");
+}
+
+// ---- XLSX decompressed-size guard -------------------------------------------
+
+#[test]
+fn honest_zip_bomb_refuses_on_declared_size_with_a_small_limit() {
+    // ~5 KB on disk, 3 MB decompressed: max_bytes alone would wave it through.
+    let opts = OpenOptions {
+        max_bytes: Some(1_000_000),
+        max_uncompressed_bytes: Some(100_000),
+        ..sheet("t")
+    };
+    let r = refusal("zip_bomb_honest.xlsx", &opts);
+    assert_eq!(r.code, RefusalCode::ETooLarge);
+    assert_eq!(r.context["limit"], json!("max_uncompressed_bytes"));
+    assert_eq!(r.context["max"], json!(100_000));
+    assert!(r.context["declared"].as_u64().unwrap() > 3_000_000);
+}
+
+#[test]
+fn honest_bomb_opens_when_the_limit_allows_it() {
+    let opts = OpenOptions {
+        max_uncompressed_bytes: Some(64 * 1024 * 1024),
+        ..sheet("t")
+    };
+    let mut table = open(&fx("zip_bomb_honest.xlsx"), &opts).unwrap();
+    assert_eq!(count_rows(&mut table), 100);
+}
+
+#[test]
+fn the_default_limit_is_two_gib_and_applies_when_unset() {
+    assert_eq!(
+        cmdrvl_tabular::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        2 * 1024 * 1024 * 1024
+    );
+    // Unset means the default, which this 3 MB workbook is far under.
+    assert!(open(&fx("zip_bomb_honest.xlsx"), &sheet("t")).is_ok());
+}
+
+#[test]
+fn lying_headers_cannot_smuggle_extra_output() {
+    // The entry declares 1000 bytes but its deflate stream holds 8 MB. The zip crate
+    // stops an entry at its declared size and errors, so the workbook refuses as
+    // unreadable under the default limit AND under a small one; nothing expands past
+    // what the central directory declared.
+    for opts in [
+        sheet("t"),
+        OpenOptions {
+            max_uncompressed_bytes: Some(1_000_000),
+            ..sheet("t")
+        },
+    ] {
+        let r = refusal("zip_bomb_lying.xlsx", &opts);
+        assert_eq!(r.code, RefusalCode::EXlsxParse, "{r:?}");
+        let rendered = serde_json::to_string(&r).unwrap();
+        assert!(!rendered.contains("aaaa"), "{rendered}");
+    }
+}
+
+#[test]
+fn normal_workbooks_are_unaffected_by_the_default_guard() {
+    let mut table = open(&fx("sample.xlsx"), &sheet("loans")).unwrap();
+    assert_eq!(count_rows(&mut table), 3);
 }

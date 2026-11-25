@@ -164,3 +164,42 @@ pq.write_table(pa.table({"id": [1], "blob": pa.array([b"secret-bytes"], pa.binar
 wb = openpyxl.Workbook(); ws = wb.active; ws.title = "t"; ws.append(["id", "elapsed"])
 ws.append([1, dt.timedelta(hours=36, minutes=30)])
 wb.save(f"{out}/excel_duration.xlsx")
+
+# ---- streaming fixtures ----
+# Parquet whose LAST row holds an unsupported value (binary), earlier rows are fine.
+pq.write_table(pa.table({"id": [1, 2, 3], "blob": pa.array([None, None, b"late"], pa.binary())}),
+               f"{out}/late_binary.parquet", row_group_size=1)
+# XLSX whose third data row holds an unsupported duration cell.
+wb = openpyxl.Workbook(); ws = wb.active; ws.title = "t"; ws.append(["id", "elapsed"])
+ws.append([1, 5]); ws.append([2, 6]); ws.append([3, dt.timedelta(hours=1)])
+wb.save(f"{out}/late_duration.xlsx")
+
+# ---- zip-bomb fixtures (XLSX decompressed-size guard) ----
+# Honest bomb: a real, valid workbook with ~3.2 MB of shared strings (Excel caps one cell at
+# 32,767 characters, so use 100 distinct near-maximal cells) that compresses to a few KB.
+wb = openpyxl.Workbook(); ws = wb.active; ws.title = "t"; ws.append(["id", "blob"])
+for i in range(100):
+    ws.append([i + 1, "A" * 32_000 + str(i)])
+wb.save(f"{out}/zip_bomb_honest.xlsx")
+
+# Lying bomb: the entry expands to 8 MB but its headers declare 1000 bytes.
+import struct, zipfile
+big = b"a" * 8_000_000
+with zipfile.ZipFile(f"{out}/zip_bomb_lying.xlsx", "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("[Content_Types].xml", b"<Types/>")
+    z.writestr("xl/worksheets/sheet1.xml", big)
+raw = bytearray(open(f"{out}/zip_bomb_lying.xlsx", "rb").read())
+name = b"xl/worksheets/sheet1.xml"
+pos = 0
+while (pos := raw.find(b"PK\x03\x04", pos)) != -1:
+    n, m = struct.unpack_from("<HH", raw, pos + 26)
+    if raw[pos + 30: pos + 30 + n] == name:
+        struct.pack_into("<I", raw, pos + 22, 1000)  # declared uncompressed size
+    pos += 4
+pos = 0
+while (pos := raw.find(b"PK\x01\x02", pos)) != -1:
+    n, m, k = struct.unpack_from("<HHH", raw, pos + 28)
+    if raw[pos + 46: pos + 46 + n] == name:
+        struct.pack_into("<I", raw, pos + 24, 1000)
+    pos += 4
+open(f"{out}/zip_bomb_lying.xlsx", "wb").write(raw)

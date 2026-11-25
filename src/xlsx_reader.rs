@@ -14,22 +14,23 @@ use crate::cell::canon_f64;
 use crate::detect::{Magic, sniff};
 use crate::refusal::{Refusal, RefusalCode};
 use crate::temporal::{excel_text, excel_time_text, iso_datetime_text};
-use crate::{Cell, Grid, Row, SheetSel, check_row_limit, missing_headers, no_data_rows};
+use crate::{Cell, Opened, Row, SheetSel, missing_headers};
 
 fn parse_refusal() -> Refusal {
     Refusal::new(RefusalCode::EXlsxParse, "not a readable workbook")
 }
 
-pub(crate) fn read(
+pub(crate) fn open(
     path: &Path,
     sheet: Option<&SheetSel>,
-    max_rows: Option<u64>,
-) -> Result<(Grid, String), Refusal> {
+    max_uncompressed: u64,
+) -> Result<Opened, Refusal> {
     match sniff(path)? {
         Magic::Zip => {
+            guard_uncompressed(path, max_uncompressed)?;
             let workbook: Xlsx<BufReader<File>> =
                 open_workbook(path).map_err(|_| parse_refusal())?;
-            read_workbook(workbook, sheet, max_rows)
+            read_workbook(workbook, sheet)
         }
         _ => {
             // OLE container: legacy BIFF `.xls`, or an encrypted OOXML package.
@@ -41,9 +42,37 @@ pub(crate) fn read(
             }
             let workbook: Xls<BufReader<File>> =
                 open_workbook(path).map_err(|_| parse_refusal())?;
-            read_workbook(workbook, sheet, max_rows)
+            read_workbook(workbook, sheet)
         }
     }
+}
+
+fn too_large(max: u64) -> Refusal {
+    Refusal::new(
+        RefusalCode::ETooLarge,
+        "workbook expands beyond max_uncompressed_bytes",
+    )
+    .with("limit", "max_uncompressed_bytes")
+    .with("max", max)
+}
+
+/// Zip-bomb guard. `max_bytes` only sees the compressed size, so this sums the
+/// declared decompressed size of every entry in the central directory before calamine
+/// reads anything. Headers cannot be used to smuggle extra output: the `zip` crate
+/// (9.x) stops an entry at its declared size and errors, which refuses as
+/// `E_XLSX_PARSE` (see the `zip_bomb_lying.xlsx` fixture).
+fn guard_uncompressed(path: &Path, max: u64) -> Result<(), Refusal> {
+    let file = File::open(path).map_err(|e| Refusal::io(&e))?;
+    let mut archive = zip::ZipArchive::new(BufReader::new(file)).map_err(|_| parse_refusal())?;
+    let mut declared = 0u64;
+    for i in 0..archive.len() {
+        let entry = archive.by_index_raw(i).map_err(|_| parse_refusal())?;
+        declared = declared.saturating_add(entry.size());
+    }
+    if declared > max {
+        return Err(too_large(max).with("declared", declared));
+    }
+    Ok(())
 }
 
 /// An encrypted `.xlsx` is an OLE file whose directory has an `EncryptedPackage`
@@ -57,11 +86,7 @@ fn contains_encrypted_package(path: &Path) -> Result<bool, Refusal> {
     Ok(bytes.windows(needle.len()).any(|w| w == needle.as_slice()))
 }
 
-fn read_workbook<R>(
-    mut workbook: R,
-    sheet: Option<&SheetSel>,
-    max_rows: Option<u64>,
-) -> Result<(Grid, String), Refusal>
+fn read_workbook<R>(mut workbook: R, sheet: Option<&SheetSel>) -> Result<Opened, Refusal>
 where
     R: Reader<BufReader<File>>,
 {
@@ -95,30 +120,38 @@ where
         .worksheet_range(&selected)
         .map_err(|_| parse_refusal())?;
     let (row0, col0) = range.start().unwrap_or((0, 0));
-    let mut iter = range.rows().enumerate();
-    let Some((_, header_row)) = iter.next() else {
+    let (height, width) = range.get_size();
+    if height == 0 {
         return Err(missing_headers());
-    };
-    let headers = header_row
-        .iter()
-        .enumerate()
-        .map(|(c, d)| Ok(cell(d, row0, col0, 0, c)?.as_bytes().to_vec()))
+    }
+    let headers = (0..width)
+        .map(|c| {
+            let data = range.get((0, c)).unwrap_or(&Data::Empty);
+            Ok(cell(data, row0, col0, 0, c)?.as_bytes().to_vec())
+        })
         .collect::<Result<Vec<_>, Refusal>>()?;
-    let mut rows = Vec::new();
-    for (r, row) in iter {
-        let index = r as u64;
-        check_row_limit(index, max_rows)?;
-        let cells = row
-            .iter()
-            .enumerate()
-            .map(|(c, d)| cell(d, row0, col0, r, c))
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.push(Row { index, cells });
-    }
-    if rows.is_empty() {
-        return Err(no_data_rows());
-    }
-    Ok(((headers, rows), selected))
+    // calamine holds the whole sheet (O(sheet) memory), but cells are converted lazily:
+    // an unsupported cell refuses on the row that holds it, after the rows before it.
+    let mut r = 0usize;
+    let rows = std::iter::from_fn(move || {
+        r += 1;
+        if r >= height {
+            return None;
+        }
+        let cells = (0..width)
+            .map(|c| cell(range.get((r, c)).unwrap_or(&Data::Empty), row0, col0, r, c))
+            .collect::<Result<Vec<_>, _>>();
+        Some(cells.map(|cells| Row {
+            index: r as u64,
+            cells,
+        }))
+    });
+    Ok(Opened {
+        headers,
+        rows: Box::new(rows),
+        delimiter: None,
+        sheet: Some(selected),
+    })
 }
 
 /// Exact name wins; otherwise a 0-based index into workbook order.

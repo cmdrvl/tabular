@@ -3,11 +3,17 @@
 //!
 //! Design: `spine-rules/docs/cmdrvl-tabular-design.md`.
 //!
-//! **v0 limit, stated plainly:** [`Table::rows`] has a streaming-shaped signature
-//! (a single-pass iterator of `Result<Row, Refusal>`), but v0 materializes the
-//! whole table inside [`open`]. Every refusal, including per-value ones, is
-//! therefore raised by `open`, never by the iterator. Memory is O(table).
-//! `max_rows` / `max_bytes` bound that cost; they do not make it streaming.
+//! **Streaming.** [`open`] reads the header and the first data row, then hands
+//! back a [`Table`] whose [`Table::rows`] is a single-pass iterator of
+//! `Result<Row, Refusal>`. CSV/TSV, JSONL and Parquet decode one row at a time
+//! (Parquet one row group at a time), so a refusal found deep in the file
+//! (ragged CSV record, nested JSON value, `max_rows` exceeded, a bad Parquet
+//! page) arrives as an `Err` from the iterator after the earlier rows were
+//! yielded; the iterator ends after the first `Err`. Refusals about the file as a
+//! whole (unreadable, wrong encoding, no header, no data rows, ambiguous sheet,
+//! the first row) still come from `open`. XLSX is not memory-streaming: calamine
+//! loads the selected sheet, so memory is O(sheet), but its cells are still
+//! converted lazily, one row per `next()`.
 
 mod cell;
 mod csv_reader;
@@ -22,6 +28,10 @@ use std::path::Path;
 
 pub use cell::{Cell, CellClass};
 pub use refusal::{Refusal, RefusalCode};
+
+/// Default decompressed-size cap for XLSX packages (2 GiB). `max_bytes` bounds the
+/// compressed file; this bounds what it expands to.
+pub const DEFAULT_MAX_UNCOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Supported containers. `.ndjson` is `Jsonl`; `.xls` and `.xlsm` are `Xlsx`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +89,10 @@ pub struct OpenOptions {
     pub max_rows: Option<u64>,
     /// Input file size on disk. Exceeding it refuses `E_TOO_LARGE`.
     pub max_bytes: Option<u64>,
+    /// XLSX/XLSM only: total decompressed size of the workbook package. `None` uses
+    /// [`DEFAULT_MAX_UNCOMPRESSED_BYTES`]; pass `Some(u64::MAX)` to lift the guard.
+    /// Exceeding it refuses `E_TOO_LARGE` (`limit: "max_uncompressed_bytes"`).
+    pub max_uncompressed_bytes: Option<u64>,
     pub csv: CsvOptions,
 }
 
@@ -101,20 +115,40 @@ impl Row {
     }
 }
 
-/// What `open` resolved. `bytes_read` is the file size: v0 readers consume the whole file.
+/// What `open` resolved. `file_size` is the input's size on disk.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceInfo {
     pub delimiter: Option<u8>,
     pub sheet: Option<String>,
-    pub bytes_read: u64,
+    pub file_size: u64,
 }
 
-#[derive(Debug)]
+/// A single-pass stream of data rows. Readers return one; `open` wraps it.
+pub(crate) type RowStream = Box<dyn Iterator<Item = Result<Row, Refusal>>>;
+
+/// What every reader hands back: headers, a lazy row stream, and what it resolved.
+pub(crate) struct Opened {
+    pub headers: Vec<Vec<u8>>,
+    pub rows: RowStream,
+    pub delimiter: Option<u8>,
+    pub sheet: Option<String>,
+}
+
 pub struct Table {
     format: Format,
     headers: Vec<Vec<u8>>,
-    rows: Vec<Row>,
+    rows: Option<RowStream>,
     source: SourceInfo,
+}
+
+impl std::fmt::Debug for Table {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Table")
+            .field("format", &self.format)
+            .field("headers", &self.headers.len())
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Table {
@@ -131,16 +165,19 @@ impl Table {
         &self.source
     }
 
-    /// Number of data rows (known because v0 materializes).
-    pub fn row_count(&self) -> usize {
-        self.rows.len()
-    }
-
     /// Single-pass iterator over the data rows. Each row has exactly
-    /// `headers().len()` cells. A second call yields nothing: rows are drained.
-    /// v0 never yields `Err` (see the crate docs).
+    /// `headers().len()` cells. A second call yields nothing: the stream is
+    /// consumed. The iterator ends after the first `Err` (a refusal found after
+    /// earlier rows were already yielded).
     pub fn rows(&mut self) -> impl Iterator<Item = Result<Row, Refusal>> + '_ {
-        std::mem::take(&mut self.rows).into_iter().map(Ok)
+        let mut stream = self.rows.take();
+        std::iter::from_fn(move || {
+            let item = stream.as_mut()?.next();
+            if !matches!(item, Some(Ok(_))) {
+                stream = None;
+            }
+            item
+        })
     }
 }
 
@@ -159,52 +196,73 @@ pub fn open(path: &Path, opts: &OpenOptions) -> Result<Table, Refusal> {
         );
     }
     let format = detect::resolve(path, opts.format)?;
-    let max_rows = opts.max_rows;
-    let (headers, rows, delimiter, sheet) = match format {
-        Format::Csv | Format::Tsv => {
-            let ((h, r), d) = csv_reader::read(path, format, &opts.csv, max_rows)?;
-            (h, r, Some(d), None)
-        }
-        Format::Jsonl => {
-            let (h, r) = jsonl_reader::read(path, max_rows)?;
-            (h, r, None, None)
-        }
-        Format::Parquet => {
-            let (h, r) = parquet_reader::read(path, max_rows)?;
-            (h, r, None, None)
-        }
-        Format::Xlsx => {
-            let ((h, r), s) = xlsx_reader::read(path, opts.sheet.as_ref(), max_rows)?;
-            (h, r, None, Some(s))
-        }
+    let opened = match format {
+        Format::Csv | Format::Tsv => csv_reader::open(path, format, &opts.csv)?,
+        Format::Jsonl => jsonl_reader::open(path)?,
+        Format::Parquet => parquet_reader::open(path, opts.max_rows)?,
+        Format::Xlsx => xlsx_reader::open(
+            path,
+            opts.sheet.as_ref(),
+            opts.max_uncompressed_bytes
+                .unwrap_or(DEFAULT_MAX_UNCOMPRESSED_BYTES),
+        )?,
+    };
+    let Opened {
+        headers,
+        rows,
+        delimiter,
+        sheet,
+    } = opened;
+    let mut rows = limited(rows, opts.max_rows);
+    // The first data row decides E_EMPTY, so it is read here; later rows are lazy.
+    let rows: RowStream = match rows.next() {
+        None => return Err(no_data_rows()),
+        Some(Err(refusal)) => return Err(refusal),
+        Some(Ok(first)) => Box::new(std::iter::once(Ok(first)).chain(rows)),
     };
     Ok(Table {
         format,
         headers,
-        rows,
+        rows: Some(rows),
         source: SourceInfo {
             delimiter,
             sheet,
-            bytes_read: size,
+            file_size: size,
         },
     })
 }
 
-/// Shared row-limit check used by every reader before it stores row `count`.
-pub(crate) fn check_row_limit(count: u64, max_rows: Option<u64>) -> Result<(), Refusal> {
-    match max_rows {
-        Some(max) if count > max => Err(Refusal::new(
-            RefusalCode::ETooLarge,
-            "input exceeds max_rows",
-        )
-        .with("limit", "max_rows")
-        .with("max", max)),
-        _ => Ok(()),
-    }
+/// Enforce `max_rows` on a stream: row `max + 1` becomes an `E_TOO_LARGE` refusal
+/// (and the stream ends there) instead of being yielded.
+fn limited(rows: RowStream, max_rows: Option<u64>) -> RowStream {
+    let Some(max) = max_rows else {
+        return rows;
+    };
+    let mut rows = rows;
+    let mut count = 0u64;
+    let mut done = false;
+    Box::new(std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let item = rows.next()?;
+        count += 1;
+        if item.is_ok() && count > max {
+            done = true;
+            return Some(Err(too_many_rows(max)));
+        }
+        if item.is_err() {
+            done = true;
+        }
+        Some(item)
+    }))
 }
 
-/// Headers plus data rows, as every reader returns them.
-pub(crate) type Grid = (Vec<Vec<u8>>, Vec<Row>);
+pub(crate) fn too_many_rows(max: u64) -> Refusal {
+    Refusal::new(RefusalCode::ETooLarge, "input exceeds max_rows")
+        .with("limit", "max_rows")
+        .with("max", max)
+}
 
 pub(crate) fn missing_headers() -> Refusal {
     Refusal::new(RefusalCode::EHeaders, "no header row").with("issue", "missing")

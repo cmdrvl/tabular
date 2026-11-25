@@ -12,7 +12,7 @@ use std::path::Path;
 
 use crate::detect::check_text_sample;
 use crate::refusal::{Refusal, RefusalCode};
-use crate::{Cell, CsvOptions, Format, Grid, Row, check_row_limit, missing_headers, no_data_rows};
+use crate::{Cell, CsvOptions, Format, Opened, Row, missing_headers};
 
 const CANDIDATE_DELIMITERS: [u8; 5] = *b",\t;|^";
 const SAMPLE_BYTES: usize = 64 * 1024;
@@ -44,12 +44,7 @@ struct Probe {
     projection: Vec<Vec<u8>>,
 }
 
-pub(crate) fn read(
-    path: &Path,
-    format: Format,
-    opts: &CsvOptions,
-    max_rows: Option<u64>,
-) -> Result<(Grid, u8), Refusal> {
+pub(crate) fn open(path: &Path, format: Format, opts: &CsvOptions) -> Result<Opened, Refusal> {
     let mut file = File::open(path).map_err(|e| Refusal::io(&e))?;
     let file_len = file.metadata().map_err(|e| Refusal::io(&e))?.len();
 
@@ -110,8 +105,8 @@ pub(crate) fn read(
             Escape::None => None,
             Escape::Backslash => Some(b'\\'),
         });
-    let mut reader = builder.from_reader(BufReader::new(file));
-    let mut records = reader.byte_records();
+    let reader = builder.from_reader(BufReader::new(file));
+    let mut records = reader.into_byte_records();
 
     let headers: Vec<Vec<u8>> = match records.next() {
         Some(Ok(record)) => record.iter().map(<[u8]>::to_vec).collect(),
@@ -119,20 +114,21 @@ pub(crate) fn read(
         None => return Err(missing_headers()),
     };
 
-    let mut rows = Vec::new();
-    for record in records {
+    let mut index = 0u64;
+    let rows = records.map(move |record| {
         let record = record.map_err(|e| csv_refusal(&e))?;
-        let index = rows.len() as u64 + 1;
-        check_row_limit(index, max_rows)?;
-        rows.push(Row {
+        index += 1;
+        Ok(Row {
             index,
             cells: record.iter().map(Cell::from_bytes).collect(),
-        });
-    }
-    if rows.is_empty() {
-        return Err(no_data_rows());
-    }
-    Ok(((headers, rows), dialect.delimiter))
+        })
+    });
+    Ok(Opened {
+        headers,
+        rows: Box::new(rows),
+        delimiter: Some(dialect.delimiter),
+        sheet: None,
+    })
 }
 
 fn read_sample(file: &mut File, offset: u64) -> Result<Vec<u8>, Refusal> {

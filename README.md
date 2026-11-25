@@ -37,6 +37,30 @@ for row in table.rows() {                    // single pass
 - Excel workbooks with more than one sheet need an explicit sheet (name or
   0-based index); otherwise `E_AMBIGUOUS_SHEET` lists the sheets.
 
+## Streaming
+
+`open` reads the header and the first data row (the first row decides `E_EMPTY`);
+`Table::rows()` then decodes lazily and is single-pass. A refusal found later
+arrives as an `Err` item after the rows before it, and the iterator ends after
+the first `Err`:
+
+- ragged or malformed CSV records, a nested JSON value, `max_rows` exceeded (the
+  row after `max_rows` is the `E_TOO_LARGE` refusal), a bad Parquet page, an
+  unsupported Parquet value in a later row, an unsupported XLSX cell in a later row;
+- still raised by `open`: unreadable file, encoding, no header, no data rows,
+  ambiguous or unknown sheet, `max_bytes`, `max_uncompressed_bytes`, a Parquet
+  footer row count over `max_rows`, and anything wrong with the first data row.
+
+JSONL takes two passes. Its headers are the union of keys in first-seen order, so
+pass 1 (inside `open`) parses every line to collect them in O(columns) memory, which
+also means a malformed JSONL line refuses at `open`; pass 2 yields rows.
+Measured once (not a test): a 171 MB, 3,000,000-row CSV read to the end peaked at
+2.9 MB resident. Parquet decodes one row group at a time, so its peak depends on
+the row-group size; that was not measured.
+
+`SourceInfo.bytes_read` is now `file_size` and `Table::row_count()` is gone: a
+stream does not know its length.
+
 ## Temporal and decimal values
 
 Rendered as fixed, ASCII text so equal values are equal bytes. Temporal values
@@ -84,10 +108,10 @@ environment variables.
 
 ## Known limits (v0)
 
-- **Not streaming.** `Table::rows()` has a streaming-shaped signature, but `open`
-  reads the whole table into memory first. Every refusal, including per-value
-  ones, comes from `open`; the iterator never yields `Err`. `max_rows` and
-  `max_bytes` bound memory, they do not stream. XLSX is O(sheet).
+- **XLSX is not memory-streaming.** CSV/TSV, JSONL and Parquet decode lazily
+  (see "Streaming"), but calamine loads the selected sheet, so XLSX memory is
+  O(sheet); its cells are still converted one row per `next()`, so an unsupported
+  cell refuses on its row, after the rows before it. Legacy `.xls` is the same.
 - **Still refused:** Parquet `binary` and nested types (struct, list, map), XLSX
   duration cells and error cells, and the XLSX cases listed under "Temporal and
   decimal values" below. They refuse `E_UNSUPPORTED_VALUE` with the type name and
@@ -99,7 +123,11 @@ environment variables.
   record inside the first 200 sampled records makes auto-detection refuse
   `E_DIALECT` (pin `CsvOptions::delimiter` to get the precise `E_CSV_PARSE`), and
   on very small files a quoted embedded newline can make the wrong delimiter win.
-- **No zip-bomb guard.** `max_bytes` checks the compressed file size only.
+- **Zip-bomb guard is declared-size only.** `max_uncompressed_bytes` (default 2 GiB)
+  sums the sizes the XLSX central directory declares. A lying header cannot add
+  output: the `zip` crate (9.x) stops an entry at its declared size and errors,
+  which refuses as `E_XLSX_PARSE`. That behavior belongs to the dependency, so
+  upgrading `zip` should re-run `zip_bomb_lying.xlsx`.
 - JSON numbers beyond i64/u64/f64 precision lose digits; carry exact decimals as
   strings.
 - The text-encoding check looks at the first 64 KiB: UTF-16/32 BOMs and NUL bytes
@@ -118,8 +146,8 @@ time.
 cargo test
 ```
 
-Runs 9 unit tests, 9 cross-format conformance tests, 30 refusal/edge tests and 13
-temporal/decimal tests.
+Runs 9 unit tests, 9 cross-format conformance tests, 35 refusal/edge tests, 8
+streaming tests and 13 temporal/decimal tests.
 The conformance tests read the same dataset as CSV, TSV, JSONL, Parquet and XLSX,
 compare each to a hard-coded expected grid, and check composite-key behaviour with
 `spine_rules::composite_key` (a git dev-dependency pinned to a commit).
