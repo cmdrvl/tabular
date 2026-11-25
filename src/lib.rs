@@ -15,6 +15,7 @@ mod detect;
 mod jsonl_reader;
 mod parquet_reader;
 mod refusal;
+mod temporal;
 mod xlsx_reader;
 
 use std::path::Path;

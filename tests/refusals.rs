@@ -91,35 +91,11 @@ fn assert_no_leak(refusal: &cmdrvl_tabular::Refusal, secret: &str) {
 }
 
 #[test]
-fn parquet_date_is_refused_without_the_value() {
-    let r = refusal("unsupported_date.parquet", &OpenOptions::default());
-    assert_eq!(r.code, RefusalCode::EUnsupportedValue);
-    assert_eq!(
-        (r.context["kind"].clone(), r.context["column"].clone()),
-        (json!("date"), json!("closed"))
-    );
-    assert_eq!(r.context["row"], json!(1));
-    assert_no_leak(&r, "2024");
-}
-
-#[test]
 fn parquet_nested_list_is_refused() {
     let r = refusal("nested_list.parquet", &OpenOptions::default());
     assert_eq!(r.code, RefusalCode::EUnsupportedValue);
     assert_eq!(r.context["kind"], json!("list"));
     assert_no_leak(&r, "\"x\"");
-}
-
-#[test]
-fn xlsx_datetime_is_refused_with_absolute_coordinates() {
-    let r = refusal("unsupported_datetime.xlsx", &OpenOptions::default());
-    assert_eq!(r.code, RefusalCode::EUnsupportedValue);
-    assert_eq!(r.context["kind"], json!("datetime"));
-    assert_eq!(
-        (r.context["row"].clone(), r.context["col"].clone()),
-        (json!(2), json!(2))
-    );
-    assert_no_leak(&r, "2031");
 }
 
 #[test]

@@ -1,20 +1,57 @@
-//! Parquet reader over the record API (no arrow). v0 renders integers, floats,
-//! booleans and strings; decimal, date, timestamp, binary, float16 and nested
-//! types refuse `E_UNSUPPORTED_VALUE` (the v1 temporal gap, see README).
+//! Parquet reader over the record API (no arrow). Renders integers, floats,
+//! booleans, strings, decimals, dates, times, timestamps (the canonical text is
+//! defined in `temporal.rs`) and float16; binary and nested types refuse
+//! `E_UNSUPPORTED_VALUE`.
+//!
+//! Column logical types come from the schema, not from the record API's field
+//! variants: the record API only maps UTC-adjusted millisecond/microsecond
+//! timestamps, so a nanosecond or non-UTC (naive) timestamp would otherwise
+//! surface as a bare integer and render as a number, silently.
 
 use std::fs::File;
 use std::path::Path;
 
+use parquet::basic::{LogicalType, TimeUnit};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::Field;
 
 use crate::cell::{canon_f32, canon_f64};
 use crate::refusal::{Refusal, RefusalCode};
+use crate::temporal::{Unit, date_text, decimal_text, time_text, timestamp_text};
 use crate::{Cell, Row, check_row_limit, missing_headers, no_data_rows};
 
 fn parse_refusal(detail: &str) -> Refusal {
     // Fixed text only: library errors are not forwarded (they could quote data).
     Refusal::new(RefusalCode::EParquetParse, detail)
+}
+
+/// What a top-level column's schema says about how to read its values.
+#[derive(Clone, Copy, Debug)]
+enum ColSpec {
+    Plain,
+    Timestamp { utc: bool, unit: Unit },
+    Time { unit: Unit },
+}
+
+fn unit_of(unit: &TimeUnit) -> Unit {
+    match unit {
+        TimeUnit::MILLIS => Unit::Millis,
+        TimeUnit::MICROS => Unit::Micros,
+        TimeUnit::NANOS => Unit::Nanos,
+    }
+}
+
+fn spec_of(field: &parquet::schema::types::Type) -> ColSpec {
+    match field.get_basic_info().logical_type_ref() {
+        Some(LogicalType::Timestamp(t)) => ColSpec::Timestamp {
+            utc: t.is_adjusted_to_u_t_c,
+            unit: unit_of(&t.unit),
+        },
+        Some(LogicalType::Time(t)) => ColSpec::Time {
+            unit: unit_of(&t.unit),
+        },
+        _ => ColSpec::Plain,
+    }
 }
 
 pub(crate) fn read(
@@ -34,6 +71,12 @@ pub(crate) fn read(
     if headers.is_empty() {
         return Err(missing_headers());
     }
+    let specs: Vec<ColSpec> = meta
+        .schema()
+        .get_fields()
+        .iter()
+        .map(|f| spec_of(f))
+        .collect();
     // Refuse on the footer's row count before decoding a single page.
     if let Some(max) = max_rows
         && meta.num_rows() > 0
@@ -51,8 +94,9 @@ pub(crate) fn read(
         let index = rows.len() as u64 + 1;
         check_row_limit(index, max_rows)?;
         let mut cells = Vec::with_capacity(headers.len());
-        for (name, field) in row.get_column_iter() {
-            cells.push(cell(field, name, index)?);
+        for (position, (name, field)) in row.get_column_iter().enumerate() {
+            let spec = specs.get(position).copied().unwrap_or(ColSpec::Plain);
+            cells.push(cell(field, spec, name, index)?);
         }
         rows.push(Row { index, cells });
     }
@@ -62,8 +106,31 @@ pub(crate) fn read(
     Ok((headers, rows))
 }
 
-fn cell(field: &Field, column: &str, row: u64) -> Result<Cell, Refusal> {
+fn cell(field: &Field, spec: ColSpec, column: &str, row: u64) -> Result<Cell, Refusal> {
     let text = |s: String| Cell::from_bytes(s);
+    let out_of_range = |kind: &str| unsupported(kind, column, row);
+    // Schema-declared temporal columns first (covers nanoseconds and non-UTC
+    // timestamps, which the record API hands over as plain integers).
+    match (spec, field) {
+        (ColSpec::Timestamp { utc, unit }, Field::Long(v))
+        | (ColSpec::Timestamp { utc, unit }, Field::TimestampMillis(v))
+        | (ColSpec::Timestamp { utc, unit }, Field::TimestampMicros(v)) => {
+            return timestamp_text(*v, unit, utc)
+                .map(text)
+                .ok_or_else(|| out_of_range("timestamp out of range"));
+        }
+        (ColSpec::Time { unit }, Field::Long(v)) => {
+            return time_text(*v, unit)
+                .map(text)
+                .ok_or_else(|| out_of_range("time out of range"));
+        }
+        (ColSpec::Time { unit }, Field::Int(v)) => {
+            return time_text(i64::from(*v), unit)
+                .map(text)
+                .ok_or_else(|| out_of_range("time out of range"));
+        }
+        _ => {}
+    }
     Ok(match field {
         Field::Null => Cell::Null,
         Field::Bool(v) => text(v.to_string()),
@@ -81,7 +148,29 @@ fn cell(field: &Field, column: &str, row: u64) -> Result<Cell, Refusal> {
         Field::Double(v) => {
             text(canon_f64(*v).ok_or_else(|| unsupported("non-finite float", column, row))?)
         }
+        Field::Float16(v) => text(
+            canon_f32(f32::from(*v)).ok_or_else(|| unsupported("non-finite float", column, row))?,
+        ),
         Field::Str(v) => Cell::from_bytes(v.as_bytes()),
+        Field::Date(days) => date_text(i64::from(*days))
+            .map(text)
+            .ok_or_else(|| out_of_range("date out of range"))?,
+        Field::Decimal(d) => decimal_text(d.data(), d.scale())
+            .map(text)
+            .ok_or_else(|| out_of_range("decimal"))?,
+        Field::TimeMillis(v) => time_text(i64::from(*v), Unit::Millis)
+            .map(text)
+            .ok_or_else(|| out_of_range("time out of range"))?,
+        Field::TimeMicros(v) => time_text(*v, Unit::Micros)
+            .map(text)
+            .ok_or_else(|| out_of_range("time out of range"))?,
+        // UTC-adjusted ms/us timestamps whose schema had no logical type (converted type only).
+        Field::TimestampMillis(v) => timestamp_text(*v, Unit::Millis, true)
+            .map(text)
+            .ok_or_else(|| out_of_range("timestamp out of range"))?,
+        Field::TimestampMicros(v) => timestamp_text(*v, Unit::Micros, true)
+            .map(text)
+            .ok_or_else(|| out_of_range("timestamp out of range"))?,
         other => return Err(unsupported(kind(other), column, row)),
     })
 }
@@ -89,11 +178,7 @@ fn cell(field: &Field, column: &str, row: u64) -> Result<Cell, Refusal> {
 /// Type name only: refusal context must never carry cell values.
 fn kind(field: &Field) -> &'static str {
     match field {
-        Field::Decimal(_) => "decimal",
         Field::Bytes(_) => "binary",
-        Field::Date(_) => "date",
-        Field::TimestampMillis(_) | Field::TimestampMicros(_) => "timestamp",
-        Field::Float16(_) => "float16",
         Field::Group(_) => "struct",
         Field::ListInternal(_) => "list",
         Field::MapInternal(_) => "map",

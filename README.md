@@ -37,6 +37,38 @@ for row in table.rows() {                    // single pass
 - Excel workbooks with more than one sheet need an explicit sheet (name or
   0-based index); otherwise `E_AMBIGUOUS_SHEET` lists the sheets.
 
+## Temporal and decimal values
+
+Rendered as fixed, ASCII text so equal values are equal bytes. Temporal values
+are text, never numbers (`classify` says `Text`); decimals classify as
+`Integer` / `Decimal`.
+
+| Value | Text |
+|---|---|
+| date | `2024-02-29` (years 0000-9999; outside that refuses) |
+| time of day | `12:30:15.250` / `.250000` / `.250000000` by source unit |
+| timestamp, UTC-adjusted | `2018-11-02T19:22:09.153Z`; 3, 6 or 9 fraction digits by unit |
+| timestamp, not UTC-adjusted | the same without `Z` (a local wall clock) |
+| decimal | exact digits, scale preserved: `12.50`, `-0.05`, `0.0000000000` |
+
+- **Parquet:** `DECIMAL` (any precision, any physical type, including 256-bit),
+  `DATE`, `TIME` and `TIMESTAMP` in millisecond, microsecond and nanosecond units,
+  and `FLOAT16` render. Column types come from the schema, so nanosecond and
+  non-UTC timestamps (which the record API hands over as plain integers) are not
+  mistaken for numbers. Legacy INT96 timestamps render as UTC milliseconds.
+- **XLSX:** datetime cells render as `YYYY-MM-DD` when the serial is a whole day,
+  otherwise as a naive millisecond timestamp (`2025-10-13T12:59:02.400`); a
+  time-only serial renders `HH:MM:SS.fff`. Both the 1900 and 1904 date systems
+  work. Excel cannot tell a date from a midnight datetime, so neither can this
+  reader. Refused: serial 60 (Excel's nonexistent 1900-02-29), serials outside
+  Excel's 0 to 9999-12-31 range, a time-only serial in a 1904 workbook (it is
+  also a valid 1904-01-01 datetime, so the file cannot say which was meant),
+  duration cells and error cells. ISO-8601 cells (`t="d"`) render only when they
+  carry no time zone.
+- **Not checked:** the expected text comes from Python's `datetime` and `decimal`
+  on files written by pyarrow and openpyxl. Other writers (Spark, DuckDB,
+  Excel itself, LibreOffice) have not been run through it.
+
 ## Refusals
 
 `open` returns a typed `Refusal { code, detail, context }` instead of guessing.
@@ -56,12 +88,10 @@ environment variables.
   reads the whole table into memory first. Every refusal, including per-value
   ones, comes from `open`; the iterator never yields `Err`. `max_rows` and
   `max_bytes` bound memory, they do not stream. XLSX is O(sheet).
-- **Temporal and decimal types are refused (planned for v1).** Parquet `decimal`,
-  `date`, `timestamp`, `binary`, `float16` and nested types, and XLSX
-  datetime / duration / error cells, refuse `E_UNSUPPORTED_VALUE`. v1 is meant to
-  render them (dates `YYYY-MM-DD`, timestamps RFC 3339 UTC, exact decimals);
-  until then refusing is deliberate, since guessing a date format would defeat
-  the point of the crate.
+- **Still refused:** Parquet `binary` and nested types (struct, list, map), XLSX
+  duration cells and error cells, and the XLSX cases listed under "Temporal and
+  decimal values" below. They refuse `E_UNSUPPORTED_VALUE` with the type name and
+  coordinates only.
 - **The CSV delimiter detector has not been checked against `shape`.** It is a
   re-implementation, written from reading `shape`'s source, of the same scoring
   (candidates `, \t ; | ^`, 64 KiB sample). It was not diffed or run against
@@ -88,7 +118,8 @@ time.
 cargo test
 ```
 
-Runs 3 unit tests, 9 cross-format conformance tests and 32 refusal/edge tests.
+Runs 9 unit tests, 9 cross-format conformance tests, 30 refusal/edge tests and 13
+temporal/decimal tests.
 The conformance tests read the same dataset as CSV, TSV, JSONL, Parquet and XLSX,
 compare each to a hard-coded expected grid, and check composite-key behaviour with
 `spine_rules::composite_key` (a git dev-dependency pinned to a commit).
@@ -96,7 +127,9 @@ compare each to a hard-coded expected grid, and check composite-key behaviour wi
 Fixtures in `tests/fixtures/` are small synthetic files, written by independent
 libraries (csv, json, pyarrow, openpyxl, msoffcrypto) so the readers are not
 validated against their own output. Regenerate them with
-`tests/fixtures/make_fixtures.py` (the `uv run` line is in its header).
+`tests/fixtures/make_fixtures.py` (the `uv run` line is in its header). The
+temporal and decimal fixtures and their expected text come from
+`tests/fixtures/make_temporal_fixtures.py`.
 
 ## License
 
