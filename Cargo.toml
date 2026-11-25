@@ -23,6 +23,7 @@ calamine = "0.38"
 parquet = { version = "60.2", default-features = false, features = ["snap", "flate2-zlib-rs", "lz4"] }
 
 [dev-dependencies]
-# Local skeleton: sibling checkout. Switch to the git dependency once the repo decision is made.
-spine-rules = { path = "../spine-rules" }
+# Pinned: the conformance tests call only `spine_rules::composite_key`
+# (`assert_ordered_tuple_semantics`, `reference_key_tuple`), unchanged since this rev.
+spine-rules = { git = "https://github.com/cmdrvl/spine-rules", rev = "cd3192ca429ec5b195045d66f7ae3ecb83a45bb1" }
 tempfile = "3"

@@ -1,86 +1,103 @@
 # cmdrvl-tabular
 
-**Local skeleton, pending the operator's repo decision.** This directory is a
-git repo with no remote. It has not been pushed anywhere or published, and
-`publish = false` is set. Design: `spine-rules/docs/cmdrvl-tabular-design.md`
-(bd-e0g).
+A small Rust library that reads **CSV, TSV, JSONL, Parquet and XLSX** into one
+cell model, so the same dataset gives the same headers and cells whichever file
+format it arrives in. It is used by [CMD+RVL](https://cmdrvl.com) tools that
+need that guarantee; the design is written up in
+[spine-rules/docs/cmdrvl-tabular-design.md](https://github.com/cmdrvl/spine-rules/blob/main/docs/cmdrvl-tabular-design.md).
 
-One deterministic reader for CSV, TSV, JSONL, Parquet and XLSX. The same
-dataset in any of the five containers yields identical headers and cells.
+**Status: pre-1.0 (v0.0.1). The API may change without notice. Not published on
+crates.io** (`publish = false`); depend on it by git if you want to try it.
 
 ```rust
 use cmdrvl_tabular::{open, OpenOptions, SheetSel};
 
-let opts = OpenOptions { sheet: Some(SheetSel::parse("loans")), max_rows: Some(1_000_000), ..Default::default() };
-let mut table = open(path, &opts)?;               // Result<Table, Refusal>
-let headers = table.headers();                    // raw bytes
-for row in table.rows() {                         // single pass
+let opts = OpenOptions {
+    sheet: Some(SheetSel::parse("loans")),   // required for multi-sheet workbooks
+    max_rows: Some(1_000_000),
+    ..Default::default()
+};
+let mut table = open(path, &opts)?;          // Result<Table, Refusal>
+let headers = table.headers();               // raw bytes, not normalized
+for row in table.rows() {                    // single pass
     let row = row?;
-    let key = row.key_components(&[1, 0]);        // hand-off to spine_rules::composite_key
+    let key = row.key_components(&[1, 0]);   // raw bytes per column, for composite keys
 }
 ```
 
-## What v0 does not do (plainly)
+## What it does
+
+- Reads five formats: CSV and TSV (delimiter auto-detected or pinned, BOM
+  stripped, optional preamble skip), JSONL / NDJSON, Parquet (via the `parquet`
+  crate's record API, no Arrow types exposed), and XLSX/XLS (via `calamine`).
+- Every cell is `Null` or non-empty `Text(bytes)`. Zero-length input is `Null` in
+  every format. `NA`, `NULL` and similar are ordinary text; whitespace is kept.
+  Numbers and booleans render to one canonical text form (`2000.0` and `2000`
+  both become `2000`), so typed formats match a CSV of the same data.
+- Excel workbooks with more than one sheet need an explicit sheet (name or
+  0-based index); otherwise `E_AMBIGUOUS_SHEET` lists the sheets.
+
+## Refusals
+
+`open` returns a typed `Refusal { code, detail, context }` instead of guessing.
+There are 15 codes (`E_IO`, `E_ENCODING`, `E_CSV_PARSE`, `E_EMPTY`, `E_HEADERS`,
+`E_DIALECT`, `E_TOO_LARGE`, `E_FORMAT`, `E_JSONL_PARSE`, `E_PARQUET_PARSE`,
+`E_XLSX_PARSE`, `E_AMBIGUOUS_SHEET`, `E_SHEET_NOT_FOUND`, `E_UNSUPPORTED_VALUE`,
+`E_ENCRYPTED`). `E_HEADERS` means no header row; `E_EMPTY` means a header but no
+data rows. A refusal carries codes, type names, row/column coordinates, sheet and
+header names only: never cell values, library error text or OS error text.
+
+The reader writes no files, keeps no cache, uses no network and reads no
+environment variables.
+
+## Known limits (v0)
 
 - **Not streaming.** `Table::rows()` has a streaming-shaped signature, but `open`
-  materializes the whole table. Every refusal, including per-value ones, comes
-  from `open`; the iterator never yields `Err` in v0. Memory is O(table);
-  `max_rows` and `max_bytes` bound it, they do not stream. XLSX is O(sheet)
-  because calamine's `worksheet_range` materializes the sheet.
-- **Temporal and decimal types are refused (v1 gap, known and sequenced).**
-  Parquet `decimal`, `date`, `timestamp`, `binary`, `float16`, nested types,
-  and XLSX datetime/duration/error cells all refuse `E_UNSUPPORTED_VALUE` with the
-  type name and coordinates. v1 renders them (dates `YYYY-MM-DD`, timestamps
-  RFC 3339 UTC, decimals exact, XLSX dates only for true Excel dates). v1 lands
-  after the flagship pair (shape, rvl) adopts v0 and before verify, benchmark
-  and canon, whose real inputs are typed. Refusing beats guessing a date format.
+  reads the whole table into memory first. Every refusal, including per-value
+  ones, comes from `open`; the iterator never yields `Err`. `max_rows` and
+  `max_bytes` bound memory, they do not stream. XLSX is O(sheet).
+- **Temporal and decimal types are refused (planned for v1).** Parquet `decimal`,
+  `date`, `timestamp`, `binary`, `float16` and nested types, and XLSX
+  datetime / duration / error cells, refuse `E_UNSUPPORTED_VALUE`. v1 is meant to
+  render them (dates `YYYY-MM-DD`, timestamps RFC 3339 UTC, exact decimals);
+  until then refusing is deliberate, since guessing a date format would defeat
+  the point of the crate.
+- **The CSV delimiter detector has not been checked against `shape`.** It is a
+  re-implementation, written from reading `shape`'s source, of the same scoring
+  (candidates `, \t ; | ^`, 64 KiB sample). It was not diffed or run against
+  `shape`. Two consequences of that scoring are tested and accepted: a ragged
+  record inside the first 200 sampled records makes auto-detection refuse
+  `E_DIALECT` (pin `CsvOptions::delimiter` to get the precise `E_CSV_PARSE`), and
+  on very small files a quoted embedded newline can make the wrong delimiter win.
 - **No zip-bomb guard.** `max_bytes` checks the compressed file size only.
-- **JSON numbers** beyond i64/u64/f64 precision lose digits; carry exact decimals as strings.
-- **Encoding check is sample-based:** UTF-16/32 BOMs and NUL bytes are refused
-  in the first 64 KiB; later NULs pass through as bytes.
+- JSON numbers beyond i64/u64/f64 precision lose digits; carry exact decimals as
+  strings.
+- The text-encoding check looks at the first 64 KiB: UTF-16/32 BOMs and NUL bytes
+  there are refused; later NULs pass through as bytes.
 
-## CSV delimiter detection: known limits
+## Not verified
 
-The detector re-implements `shape`'s scoring from reading its source (candidates
-`, \t ; | ^`, 64 KiB sample cut at the last newline, ordering by records parsed,
-then mode count, then mode fields). It has **not** been diffed or run against
-`shape`. Two behaviors follow from that scoring and are pinned or avoided in tests:
-
-- A ragged record inside the first 200 sampled records drops that delimiter's
-  probe, so detection refuses `E_DIALECT`. Pin `CsvOptions::delimiter` to get the
-  precise `E_CSV_PARSE` with line and field counts.
-- On very small files, a quoted embedded newline can make a one-field probe parse
-  more records than the right delimiter and win. Pin the delimiter.
-
-## Rules
-
-- `Cell::Text` is never empty: zero-length input is `Null` in every format.
-- `NA`, `NULL`, `N/A` are ordinary text. Whitespace is preserved; trimming is the key layer's job.
-- Refusal `detail` and `context` carry codes, type names, coordinates, sheet
-  and header names only. No cell values, no library error text, no OS error text.
-- No files written, no temp files, no cache, no network, no env reads.
-- A name that matches a sheet beats an index reading of the same text. Multi-sheet
-  workbook without a sheet: `E_AMBIGUOUS_SHEET` listing every sheet (hidden included).
-- 15 refusal codes: shape's seven (`E_IO E_ENCODING E_CSV_PARSE E_EMPTY E_HEADERS E_DIALECT E_TOO_LARGE`)
-  plus `E_FORMAT E_JSONL_PARSE E_PARQUET_PARSE E_XLSX_PARSE E_AMBIGUOUS_SHEET E_SHEET_NOT_FOUND E_UNSUPPORTED_VALUE E_ENCRYPTED`.
-  `E_HEADERS` = no header row at all; `E_EMPTY` = header but no data rows (as in shape).
+`.xls` (BIFF) and `.xlsm` (no fixtures); Parquet brotli (not compiled in); XLSX
+formulas and merged cells; backslash-escaped CSV; the `zstd` codec on a machine
+without a C compiler (`--no-default-features` drops it); binary size and build
+time.
 
 ## Tests
 
 ```
-cargo test        # 3 unit, 9 cross-format conformance, 32 refusal/edge tests
+cargo test
 ```
 
-`tests/conformance.rs` reads the same dataset as CSV, TSV, JSONL, Parquet and XLSX
-and compares each to a hard-coded golden grid, then runs the cells through
-`spine_rules::composite_key` (local path dev-dependency on `../spine-rules`).
-Fixtures in `tests/fixtures/` are written by independent libraries (csv, json,
-pyarrow, openpyxl, msoffcrypto); regenerate with `make_fixtures.py` (header comment
-has the `uv run` line).
+Runs 3 unit tests, 9 cross-format conformance tests and 32 refusal/edge tests.
+The conformance tests read the same dataset as CSV, TSV, JSONL, Parquet and XLSX,
+compare each to a hard-coded expected grid, and check composite-key behaviour with
+`spine_rules::composite_key` (a git dev-dependency pinned to a commit).
 
-## Not verified
+Fixtures in `tests/fixtures/` are small synthetic files, written by independent
+libraries (csv, json, pyarrow, openpyxl, msoffcrypto) so the readers are not
+validated against their own output. Regenerate them with
+`tests/fixtures/make_fixtures.py` (the `uv run` line is in its header).
 
-`.xls` (BIFF) and `.xlsm` (no fixture); `.ndjson` beyond one temp-file test; Parquet
-brotli (not compiled in); `zstd` on a build without a C compiler; XLSX
-formulas/merged cells; backslash-escaped CSV; detector parity against `shape`;
-`fingerprint`'s calamine 0.26 code against 0.38; release binary size and build time.
+## License
+
+MIT. See [LICENSE](LICENSE).
