@@ -51,6 +51,12 @@ the first `Err`:
   ambiguous or unknown sheet, `max_bytes`, `max_uncompressed_bytes`, a Parquet
   footer row count over `max_rows`, and anything wrong with the first data row.
 
+The default `preserve-order` feature turns on `serde_json/preserve_order`, which
+changes JSON key order everywhere in the consuming binary. The reader does not
+need it. A consumer that must keep `serde_json`'s sorted keys depends with
+`default-features = false` and adds `features = ["zstd"]` if it reads zstd
+Parquet.
+
 JSONL takes two passes. Its headers are the union of keys in first-seen order, so
 pass 1 (inside `open`) parses every line to collect them in O(columns) memory, which
 also means a malformed JSONL line refuses at `open`; pass 2 yields rows.

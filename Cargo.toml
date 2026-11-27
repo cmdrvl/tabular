@@ -8,16 +8,18 @@ license = "MIT"
 publish = false
 
 [features]
-default = ["zstd"]
+default = ["zstd", "preserve-order"]
 # Parquet zstd codec. Pulls a C dependency (zstd-sys); disable for pure-Rust builds.
 zstd = ["parquet/zstd"]
+# Turns on `serde_json/preserve_order` for the whole build, which also changes the
+# key order of the consumer's own JSON. On by default so existing consumers keep
+# what they had. This crate does not need it: disabling it changes no output here.
+preserve-order = ["serde_json/preserve_order"]
 
 [dependencies]
 csv = "1.4"
 serde = { version = "1", features = ["derive"] }
-# preserve_order: without it JSONL object keys come back sorted and headers stop
-# matching the CSV/Parquet column order.
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = "1"
 calamine = "0.38"
 # Same version calamine pulls in. Used only to measure XLSX decompressed size before calamine reads it.
 zip = { version = "9.0", default-features = false, features = ["deflate"] }

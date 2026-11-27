@@ -372,6 +372,37 @@ fn jsonl_ragged_keys_use_first_seen_union_order_with_null_padding() {
 }
 
 #[test]
+fn jsonl_headers_follow_the_line_and_a_repeated_key_keeps_its_place() {
+    // Holds with and without the `preserve-order` feature.
+    let (_d, p) = temp(
+        "o.jsonl",
+        b"{\"zeta\":1,\"alpha\":2,\"zeta\":3,\"mid\":4}\n",
+    );
+    let mut table = open(&p, &OpenOptions::default()).unwrap();
+    let (headers, rows) = grid(&mut table);
+    assert_eq!(
+        headers,
+        vec![b"zeta".to_vec(), b"alpha".to_vec(), b"mid".to_vec()]
+    );
+    assert_eq!(rows[0], vec![t("3"), t("2"), t("4")]);
+}
+
+#[test]
+fn jsonl_tells_a_non_object_from_malformed_text() {
+    for (text, message) in [
+        (&b"  [1,2]\n"[..], "line is not a JSON object"),
+        (b"7\n", "line is not a JSON object"),
+        (b"nope\n", "invalid JSON"),
+        (b"{\"a\":1} trailing\n", "invalid JSON"),
+    ] {
+        let (_d, p) = temp("x.jsonl", text);
+        let r = open(&p, &OpenOptions::default()).unwrap_err();
+        assert_eq!(r.code, RefusalCode::EJsonlParse);
+        assert_eq!(r.detail, message);
+    }
+}
+
+#[test]
 fn jsonl_numbers_render_canonically() {
     let (_d, p) = temp(
         "n.jsonl",

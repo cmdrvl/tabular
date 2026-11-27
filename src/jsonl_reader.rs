@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
+use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
 use crate::cell::canon_f64;
@@ -33,7 +34,7 @@ pub(crate) fn open(path: &Path) -> Result<Opened, Refusal> {
     let mut positions: BTreeMap<String, usize> = BTreeMap::new();
     let mut lines = Lines::new(path, bom)?;
     while let Some(object) = lines.next_object()? {
-        for key in object.keys() {
+        for (key, _) in &object {
             positions.entry(key.clone()).or_insert_with(|| {
                 headers.push(key.as_bytes().to_vec());
                 headers.len() - 1
@@ -79,6 +80,41 @@ pub(crate) fn open(path: &Path) -> Result<Opened, Refusal> {
     })
 }
 
+/// A JSON object's fields in the order the line wrote them. `serde_json::Map`
+/// keeps that order only under `serde_json/preserve_order`, which is a switch for
+/// the whole build, so headers do not depend on it. A repeated key keeps its first
+/// position and its last value.
+struct OrderedObject(Vec<(String, Value)>);
+
+impl<'de> Deserialize<'de> for OrderedObject {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Fields;
+        impl<'de> Visitor<'de> for Fields {
+            type Value = OrderedObject;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut fields: Vec<(String, Value)> = Vec::new();
+                let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, Value>()? {
+                    match seen.get(&key) {
+                        Some(&at) => fields[at].1 = value,
+                        None => {
+                            seen.insert(key.clone(), fields.len());
+                            fields.push((key, value));
+                        }
+                    }
+                }
+                Ok(OrderedObject(fields))
+            }
+        }
+        deserializer.deserialize_map(Fields)
+    }
+}
+
 /// Line-by-line object reader shared by both passes.
 struct Lines {
     reader: BufReader<File>,
@@ -99,7 +135,7 @@ impl Lines {
     }
 
     /// The next JSON object (blank lines skipped), or `None` at end of file.
-    fn next_object(&mut self) -> Result<Option<serde_json::Map<String, Value>>, Refusal> {
+    fn next_object(&mut self) -> Result<Option<Vec<(String, Value)>>, Refusal> {
         loop {
             self.buf.clear();
             let n = self
@@ -113,18 +149,23 @@ impl Lines {
             if self.buf.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let value: Value = serde_json::from_slice(&self.buf).map_err(|e| {
+            let line_no = self.line_no;
+            let invalid = |e: serde_json::Error| {
                 Refusal::new(RefusalCode::EJsonlParse, "invalid JSON")
-                    .with("line", self.line_no)
+                    .with("line", line_no)
                     .with("column", e.column())
-            })?;
-            let Value::Object(object) = value else {
+            };
+            let first = self.buf.iter().find(|byte| !byte.is_ascii_whitespace());
+            if first != Some(&b'{') {
+                // Malformed text and a well-formed non-object are reported apart.
+                serde_json::from_slice::<Value>(&self.buf).map_err(invalid)?;
                 return Err(
                     Refusal::new(RefusalCode::EJsonlParse, "line is not a JSON object")
-                        .with("line", self.line_no),
+                        .with("line", line_no),
                 );
-            };
-            return Ok(Some(object));
+            }
+            let OrderedObject(fields) = serde_json::from_slice(&self.buf).map_err(invalid)?;
+            return Ok(Some(fields));
         }
     }
 }
