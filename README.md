@@ -10,7 +10,7 @@ need that guarantee; the design is written up in
 crates.io** (`publish = false`); depend on it by git if you want to try it.
 
 ```rust
-use cmdrvl_tabular::{open, OpenOptions, SheetSel};
+use cmdrvl_tabular::{open, open_bytes, OpenOptions, SheetSel};
 
 let opts = OpenOptions {
     sheet: Some(SheetSel::parse("loans")),   // required for multi-sheet workbooks
@@ -23,6 +23,9 @@ for row in table.rows() {                    // single pass
     let row = row?;
     let key = row.key_components(&[1, 0]);   // raw bytes per column, for composite keys
 }
+
+// In-memory callers provide an extension hint (or set opts.format explicitly).
+let mut table = open_bytes(bytes, Some("data.csv"), &opts)?;
 ```
 
 ## What it does
@@ -112,6 +115,13 @@ header names only: never cell values, library error text or OS error text.
 The reader writes no files, keeps no cache, uses no network and reads no
 environment variables.
 
+`open_bytes(bytes, name_hint, opts)` has the same format, cell, streaming and
+typed-refusal contract without filesystem access. `name_hint` is used only for
+extension-based format resolution; pass `None` when `opts.format` is explicit.
+It supports CSV, TSV, JSONL, Parquet and XLSX/XLS, including the same
+`max_bytes`, `max_rows` and `max_uncompressed_bytes` limits. JSONL number
+rendering is identical to `open`.
+
 ## Known limits (v0)
 
 - **XLSX is not memory-streaming.** CSV/TSV, JSONL and Parquet decode lazily
@@ -176,10 +186,13 @@ top-left cell, the merged-away cells read as `Null`), Parquet brotli (the
 
 ```
 cargo test
+cargo check --target wasm32-unknown-unknown --no-default-features
 ```
 
 Runs 9 unit tests, 9 cross-format conformance tests, 35 refusal/edge tests, 4 shape-parity tests, 8
-streaming tests, 13 temporal/decimal tests and 6 format/workbook-feature tests.
+streaming tests, 13 temporal/decimal tests, 6 format/workbook-feature tests and
+the in-memory `open_bytes` parity tests. The latter compare all five formats,
+the three size limits, zip-bomb and malformed-input refusals against `open`.
 The conformance tests read the same dataset as CSV, TSV, JSONL, Parquet and XLSX,
 compare each to a hard-coded expected grid, and check composite-key behaviour with
 `spine_rules::composite_key` (a git dev-dependency pinned to a commit).

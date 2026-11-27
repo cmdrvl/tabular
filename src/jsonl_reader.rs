@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::Path;
 
 use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
@@ -32,7 +32,10 @@ pub(crate) fn open(path: &Path) -> Result<Opened, Refusal> {
 
     let mut headers: Vec<Vec<u8>> = Vec::new();
     let mut positions: BTreeMap<String, usize> = BTreeMap::new();
-    let mut lines = Lines::new(path, bom)?;
+    let mut lines = Lines::new(
+        BufReader::new(File::open(path).map_err(|e| Refusal::io(&e))?),
+        bom,
+    )?;
     while let Some(object) = lines.next_object()? {
         for (key, _) in &object {
             positions.entry(key.clone()).or_insert_with(|| {
@@ -46,7 +49,10 @@ pub(crate) fn open(path: &Path) -> Result<Opened, Refusal> {
     }
 
     let width = headers.len();
-    let mut pass2 = Lines::new(path, bom)?;
+    let mut pass2 = Lines::new(
+        BufReader::new(File::open(path).map_err(|e| Refusal::io(&e))?),
+        bom,
+    )?;
     let mut index = 0u64;
     let rows = std::iter::from_fn(move || {
         let object = match pass2.next_object() {
@@ -59,6 +65,57 @@ pub(crate) fn open(path: &Path) -> Result<Opened, Refusal> {
         for (key, value) in &object {
             // Every key was seen in pass 1, so it has a position; a miss would mean the
             // file changed between passes, which is an I/O-level refusal.
+            let Some(&column) = positions.get(key) else {
+                return Some(Err(Refusal::new(
+                    RefusalCode::EJsonlParse,
+                    "file changed while reading",
+                )));
+            };
+            match json_cell(value, key, index) {
+                Ok(cell) => cells[column] = cell,
+                Err(refusal) => return Some(Err(refusal)),
+            }
+        }
+        Some(Ok(Row { index, cells }))
+    });
+    Ok(Opened {
+        headers,
+        rows: Box::new(rows),
+        delimiter: None,
+        sheet: None,
+    })
+}
+
+pub(crate) fn open_bytes(bytes: Vec<u8>) -> Result<Opened, Refusal> {
+    let head = &bytes[..bytes.len().min(64 * 1024)];
+    let bom = check_text_sample(head)?;
+    let mut headers: Vec<Vec<u8>> = Vec::new();
+    let mut positions: BTreeMap<String, usize> = BTreeMap::new();
+    let mut lines = Lines::new(BufReader::new(Cursor::new(bytes.clone())), bom)?;
+    while let Some(object) = lines.next_object()? {
+        for (key, _) in &object {
+            positions.entry(key.clone()).or_insert_with(|| {
+                headers.push(key.as_bytes().to_vec());
+                headers.len() - 1
+            });
+        }
+    }
+    if headers.is_empty() {
+        return Err(missing_headers());
+    }
+
+    let width = headers.len();
+    let mut pass2 = Lines::new(BufReader::new(Cursor::new(bytes)), bom)?;
+    let mut index = 0u64;
+    let rows = std::iter::from_fn(move || {
+        let object = match pass2.next_object() {
+            Ok(Some(next)) => next,
+            Ok(None) => return None,
+            Err(refusal) => return Some(Err(refusal)),
+        };
+        index += 1;
+        let mut cells = vec![Cell::Null; width];
+        for (key, value) in &object {
             let Some(&column) = positions.get(key) else {
                 return Some(Err(Refusal::new(
                     RefusalCode::EJsonlParse,
@@ -116,15 +173,14 @@ impl<'de> Deserialize<'de> for OrderedObject {
 }
 
 /// Line-by-line object reader shared by both passes.
-struct Lines {
-    reader: BufReader<File>,
+struct Lines<R> {
+    reader: R,
     line_no: u64,
     buf: Vec<u8>,
 }
 
-impl Lines {
-    fn new(path: &Path, bom: usize) -> Result<Self, Refusal> {
-        let mut reader = BufReader::new(File::open(path).map_err(|e| Refusal::io(&e))?);
+impl<R: BufRead> Lines<R> {
+    fn new(mut reader: R, bom: usize) -> Result<Self, Refusal> {
         let mut skip = vec![0u8; bom];
         reader.read_exact(&mut skip).map_err(|e| Refusal::io(&e))?;
         Ok(Self {

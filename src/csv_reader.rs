@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::detect::check_text_sample;
@@ -125,6 +125,86 @@ pub(crate) fn open(path: &Path, format: Format, opts: &CsvOptions) -> Result<Ope
     Err(missing_headers())
 }
 
+pub(crate) fn open_bytes(
+    bytes: Vec<u8>,
+    format: Format,
+    opts: &CsvOptions,
+) -> Result<Opened, Refusal> {
+    let file_len = bytes.len() as u64;
+    let head = &bytes[..bytes.len().min(SAMPLE_BYTES)];
+    let bom = check_text_sample(head)?;
+    let mut body_offset = bom as u64;
+    if opts.skip_rows > 0 {
+        let mut lines = BufReader::new(Cursor::new(&bytes));
+        lines
+            .seek(SeekFrom::Start(body_offset))
+            .map_err(|e| Refusal::io(&e))?;
+        let mut scratch = Vec::new();
+        for _ in 0..opts.skip_rows {
+            scratch.clear();
+            let n = lines
+                .read_until(b'\n', &mut scratch)
+                .map_err(|e| Refusal::io(&e))?;
+            body_offset += n as u64;
+            if n == 0 {
+                break;
+            }
+        }
+    }
+    let body_start = body_offset as usize;
+    let sample_end = body_start.saturating_add(SAMPLE_BYTES).min(bytes.len());
+    let sample = &bytes[body_start..sample_end];
+    if sample.is_empty() {
+        return Err(missing_headers());
+    }
+    check_text_sample(sample)?;
+
+    let pinned = opts.delimiter.or(if format == Format::Tsv {
+        Some(b'\t')
+    } else {
+        None
+    });
+    let sep = sep_directive(sample);
+    let (delimiter, consumed, modes): (u8, u64, &[Escape]) = if let Some(delimiter) = pinned {
+        (
+            delimiter,
+            sep.map_or(0, |s| s.consumed),
+            &[Escape::None, Escape::Backslash],
+        )
+    } else if let Some(sep) = sep {
+        (
+            sep.delimiter,
+            sep.consumed,
+            &[Escape::None, Escape::Backslash],
+        )
+    } else {
+        let dialect = detect_dialect_bytes(&bytes, sample, body_offset, file_len)?;
+        let modes: &[Escape] = match dialect.escape {
+            Escape::None => &[Escape::None],
+            Escape::Backslash => &[Escape::Backslash],
+        };
+        (dialect.delimiter, 0, modes)
+    };
+
+    for (attempt, escape) in modes.iter().enumerate() {
+        match start_bytes(bytes.clone(), body_offset + consumed, delimiter, *escape) {
+            Ok((headers, rows)) => {
+                return Ok(Opened {
+                    headers,
+                    rows,
+                    delimiter: Some(delimiter),
+                    sheet: None,
+                });
+            }
+            Err(refusal) if attempt + 1 < modes.len() && refusal.code == RefusalCode::ECsvParse => {
+                continue;
+            }
+            Err(refusal) => return Err(refusal),
+        }
+    }
+    Err(missing_headers())
+}
+
 /// Open the body at `offset`, read the header and probe the first data record (a parse
 /// error there is reported now, so the escape fallback can react), and return the headers
 /// plus a lazy stream that starts with that first record.
@@ -135,6 +215,49 @@ fn start(
     escape: Escape,
 ) -> Result<(Vec<Vec<u8>>, RowStream), Refusal> {
     let mut file = File::open(path).map_err(|e| Refusal::io(&e))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| Refusal::io(&e))?;
+    let mut builder = csv::ReaderBuilder::new();
+    builder
+        .has_headers(false)
+        .flexible(false)
+        .delimiter(delimiter)
+        .escape(match escape {
+            Escape::None => None,
+            Escape::Backslash => Some(b'\\'),
+        });
+    let reader = builder.from_reader(BufReader::new(file));
+    let mut records = reader.into_byte_records();
+
+    let headers: Vec<Vec<u8>> = match records.next() {
+        Some(Ok(record)) => record.iter().map(<[u8]>::to_vec).collect(),
+        Some(Err(error)) => return Err(csv_refusal(&error)),
+        None => return Err(missing_headers()),
+    };
+    let first = match records.next() {
+        Some(Err(error)) => return Err(csv_refusal(&error)),
+        other => other,
+    };
+
+    let mut index = 0u64;
+    let rows = first.into_iter().chain(records).map(move |record| {
+        let record = record.map_err(|e| csv_refusal(&e))?;
+        index += 1;
+        Ok(Row {
+            index,
+            cells: record.iter().map(Cell::from_bytes).collect(),
+        })
+    });
+    Ok((headers, Box::new(rows)))
+}
+
+fn start_bytes(
+    bytes: Vec<u8>,
+    offset: u64,
+    delimiter: u8,
+    escape: Escape,
+) -> Result<(Vec<Vec<u8>>, RowStream), Refusal> {
+    let mut file = Cursor::new(bytes);
     file.seek(SeekFrom::Start(offset))
         .map_err(|e| Refusal::io(&e))?;
     let mut builder = csv::ReaderBuilder::new();
@@ -260,6 +383,21 @@ fn detect_dialect(
             file.seek(SeekFrom::Start(body_offset))
                 .map_err(|e| Refusal::io(&e))?;
             Ok(Box::new(BufReader::new(file)))
+        }),
+        other => other,
+    }
+}
+
+fn detect_dialect_bytes(
+    bytes: &[u8],
+    sample: &[u8],
+    body_offset: u64,
+    file_len: u64,
+) -> Result<Dialect, Refusal> {
+    match detect(&|| Ok(Box::new(sample))) {
+        Err(_) if body_offset + (sample.len() as u64) < file_len => detect(&|| {
+            let body_start = body_offset as usize;
+            Ok(Box::new(Cursor::new(bytes[body_start..].to_vec())))
         }),
         other => other,
     }

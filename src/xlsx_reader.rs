@@ -5,13 +5,13 @@
 //! timestamps (`temporal.rs`); durations and error cells refuse.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor, Read, Seek};
 use std::path::Path;
 
-use calamine::{Data, Reader, Xls, Xlsx, open_workbook};
+use calamine::{Data, Reader, Xls, Xlsx, open_workbook, open_workbook_from_rs};
 
 use crate::cell::canon_f64;
-use crate::detect::{Magic, sniff};
+use crate::detect::{Magic, sniff, sniff_bytes};
 use crate::refusal::{Refusal, RefusalCode};
 use crate::temporal::{excel_text, excel_time_text, iso_datetime_text};
 use crate::{Cell, Opened, Row, SheetSel, missing_headers};
@@ -47,6 +47,32 @@ pub(crate) fn open(
     }
 }
 
+pub(crate) fn open_bytes(
+    bytes: Vec<u8>,
+    sheet: Option<&SheetSel>,
+    max_uncompressed: u64,
+) -> Result<Opened, Refusal> {
+    match sniff_bytes(&bytes) {
+        Magic::Zip => {
+            guard_uncompressed_bytes(&bytes, max_uncompressed)?;
+            let workbook: Xlsx<Cursor<Vec<u8>>> =
+                open_workbook_from_rs(Cursor::new(bytes)).map_err(|_| parse_refusal())?;
+            read_workbook(workbook, sheet)
+        }
+        _ => {
+            if contains_encrypted_package_bytes(&bytes) {
+                return Err(Refusal::new(
+                    RefusalCode::EEncrypted,
+                    "workbook is password-protected",
+                ));
+            }
+            let workbook: Xls<Cursor<Vec<u8>>> =
+                open_workbook_from_rs(Cursor::new(bytes)).map_err(|_| parse_refusal())?;
+            read_workbook(workbook, sheet)
+        }
+    }
+}
+
 fn too_large(max: u64) -> Refusal {
     Refusal::new(
         RefusalCode::ETooLarge,
@@ -75,6 +101,19 @@ fn guard_uncompressed(path: &Path, max: u64) -> Result<(), Refusal> {
     Ok(())
 }
 
+fn guard_uncompressed_bytes(bytes: &[u8], max: u64) -> Result<(), Refusal> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|_| parse_refusal())?;
+    let mut declared = 0u64;
+    for i in 0..archive.len() {
+        let entry = archive.by_index_raw(i).map_err(|_| parse_refusal())?;
+        declared = declared.saturating_add(entry.size());
+    }
+    if declared > max {
+        return Err(too_large(max).with("declared", declared));
+    }
+    Ok(())
+}
+
 /// An encrypted `.xlsx` is an OLE file whose directory has an `EncryptedPackage`
 /// stream. Directory names are UTF-16LE, so search for that byte pattern.
 fn contains_encrypted_package(path: &Path) -> Result<bool, Refusal> {
@@ -86,9 +125,18 @@ fn contains_encrypted_package(path: &Path) -> Result<bool, Refusal> {
     Ok(bytes.windows(needle.len()).any(|w| w == needle.as_slice()))
 }
 
-fn read_workbook<R>(mut workbook: R, sheet: Option<&SheetSel>) -> Result<Opened, Refusal>
+fn contains_encrypted_package_bytes(bytes: &[u8]) -> bool {
+    let needle: Vec<u8> = "EncryptedPackage"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    bytes.windows(needle.len()).any(|w| w == needle.as_slice())
+}
+
+fn read_workbook<R, RS>(mut workbook: R, sheet: Option<&SheetSel>) -> Result<Opened, Refusal>
 where
-    R: Reader<BufReader<File>>,
+    R: Reader<RS>,
+    RS: Read + Seek,
 {
     let names = workbook.sheet_names();
     let listing = || serde_json::Value::from(names.clone());

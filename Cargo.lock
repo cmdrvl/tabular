@@ -157,6 +157,7 @@ dependencies = [
 name = "cmdrvl-tabular"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "calamine",
  "csv",
  "parquet",

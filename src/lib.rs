@@ -232,6 +232,62 @@ pub fn open(path: &Path, opts: &OpenOptions) -> Result<Table, Refusal> {
     })
 }
 
+/// Open an in-memory table without touching the filesystem. `name_hint` supplies the
+/// extension used for format resolution when `opts.format` is `None`; callers that
+/// provide `opts.format` may pass `None`. The bytes are owned so all lazy row readers
+/// remain valid after this function returns.
+pub fn open_bytes(
+    bytes: Vec<u8>,
+    name_hint: Option<&str>,
+    opts: &OpenOptions,
+) -> Result<Table, Refusal> {
+    let size = bytes.len() as u64;
+    if let Some(max) = opts.max_bytes
+        && size > max
+    {
+        return Err(
+            Refusal::new(RefusalCode::ETooLarge, "input exceeds max_bytes")
+                .with("limit", "max_bytes")
+                .with("max", max)
+                .with("actual", size),
+        );
+    }
+    let format = detect::resolve_bytes(name_hint, opts.format, &bytes)?;
+    let opened = match format {
+        Format::Csv | Format::Tsv => csv_reader::open_bytes(bytes.clone(), format, &opts.csv)?,
+        Format::Jsonl => jsonl_reader::open_bytes(bytes.clone())?,
+        Format::Parquet => parquet_reader::open_bytes(bytes.clone(), opts.max_rows)?,
+        Format::Xlsx => xlsx_reader::open_bytes(
+            bytes,
+            opts.sheet.as_ref(),
+            opts.max_uncompressed_bytes
+                .unwrap_or(DEFAULT_MAX_UNCOMPRESSED_BYTES),
+        )?,
+    };
+    let Opened {
+        headers,
+        rows,
+        delimiter,
+        sheet,
+    } = opened;
+    let mut rows = limited(rows, opts.max_rows);
+    let rows: RowStream = match rows.next() {
+        None => return Err(no_data_rows()),
+        Some(Err(refusal)) => return Err(refusal),
+        Some(Ok(first)) => Box::new(std::iter::once(Ok(first)).chain(rows)),
+    };
+    Ok(Table {
+        format,
+        headers,
+        rows: Some(rows),
+        source: SourceInfo {
+            delimiter,
+            sheet,
+            file_size: size,
+        },
+    })
+}
+
 /// Enforce `max_rows` on a stream: row `max + 1` becomes an `E_TOO_LARGE` refusal
 /// (and the stream ends there) instead of being yielded.
 fn limited(rows: RowStream, max_rows: Option<u64>) -> RowStream {

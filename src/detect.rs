@@ -109,6 +109,62 @@ pub(crate) fn resolve(path: &Path, requested: Option<Format>) -> Result<Format, 
     }
 }
 
+pub(crate) fn resolve_bytes(
+    name_hint: Option<&str>,
+    requested: Option<Format>,
+    bytes: &[u8],
+) -> Result<Format, Refusal> {
+    let extension = name_hint
+        .and_then(|name| Path::new(name).extension())
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let format = match requested.or_else(|| format_from_extension(&extension)) {
+        Some(format) => format,
+        None => {
+            return Err(Refusal::new(
+                RefusalCode::EFormat,
+                "unsupported or missing file extension",
+            )
+            .with("extension", extension));
+        }
+    };
+    let magic = sniff_bytes(bytes);
+    let agrees = match format {
+        Format::Parquet => magic == Magic::Parquet,
+        Format::Xlsx => matches!(magic, Magic::Zip | Magic::Ole),
+        Format::Csv | Format::Tsv | Format::Jsonl => magic == Magic::Text,
+    };
+    if agrees {
+        Ok(format)
+    } else {
+        Err(Refusal::new(
+            RefusalCode::EFormat,
+            "file content does not match the format",
+        )
+        .with("expected", format.as_str())
+        .with("detected", magic.as_str())
+        .with("extension", extension))
+    }
+}
+
+pub(crate) fn sniff_bytes(bytes: &[u8]) -> Magic {
+    let head = &bytes[..bytes.len().min(8)];
+    if head.starts_with(b"PAR1") && bytes.len() >= 8 {
+        let tail = &bytes[bytes.len() - 4..];
+        if tail == b"PAR1" {
+            return Magic::Parquet;
+        }
+    }
+    if head.starts_with(b"PK\x03\x04") {
+        return Magic::Zip;
+    }
+    if head.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
+        return Magic::Ole;
+    }
+    Magic::Text
+}
+
 /// NUL bytes are looked for in this many bytes after the BOM, as shape does (8 KiB).
 const NUL_SCAN_BYTES: usize = 8 * 1024;
 

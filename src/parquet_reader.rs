@@ -11,8 +11,9 @@
 use std::fs::File;
 use std::path::Path;
 
+use bytes::Bytes;
 use parquet::basic::{LogicalType, TimeUnit};
-use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::file::reader::{ChunkReader, FileReader, SerializedFileReader};
 use parquet::record::{Field, reader::RowIter};
 
 use crate::cell::{canon_f32, canon_f64};
@@ -58,6 +59,19 @@ pub(crate) fn open(path: &Path, max_rows: Option<u64>) -> Result<Opened, Refusal
     let file = File::open(path).map_err(|e| Refusal::io(&e))?;
     let reader = SerializedFileReader::new(file)
         .map_err(|_| parse_refusal("not a readable Parquet file"))?;
+    open_reader(reader, max_rows)
+}
+
+pub(crate) fn open_bytes(bytes: Vec<u8>, max_rows: Option<u64>) -> Result<Opened, Refusal> {
+    let reader = SerializedFileReader::new(Bytes::from(bytes))
+        .map_err(|_| parse_refusal("not a readable Parquet file"))?;
+    open_reader(reader, max_rows)
+}
+
+fn open_reader<R: ChunkReader + 'static>(
+    reader: SerializedFileReader<R>,
+    max_rows: Option<u64>,
+) -> Result<Opened, Refusal> {
     let meta = reader.metadata().file_metadata();
     let headers: Vec<Vec<u8>> = meta
         .schema()
