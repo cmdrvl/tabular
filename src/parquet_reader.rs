@@ -12,7 +12,7 @@ use std::fs::File;
 use std::path::Path;
 
 use bytes::Bytes;
-use parquet::basic::{LogicalType, TimeUnit};
+use parquet::basic::{Encoding, LogicalType, TimeUnit};
 use parquet::file::reader::{ChunkReader, FileReader, SerializedFileReader};
 use parquet::record::{Field, reader::RowIter};
 
@@ -72,8 +72,15 @@ fn open_reader<R: ChunkReader + 'static>(
     reader: SerializedFileReader<R>,
     max_rows: Option<u64>,
 ) -> Result<Opened, Refusal> {
-    validate_column_ranges(reader.metadata())?;
     let meta = reader.metadata().file_metadata();
+    // Refuse on the footer's row count before inspecting column metadata or decoding a page.
+    if let Some(max) = max_rows
+        && meta.num_rows() > 0
+        && meta.num_rows() as u64 > max
+    {
+        return Err(too_many_rows(max));
+    }
+    validate_column_ranges(reader.metadata())?;
     let headers: Vec<Vec<u8>> = meta
         .schema()
         .get_fields()
@@ -89,14 +96,6 @@ fn open_reader<R: ChunkReader + 'static>(
         .iter()
         .map(|f| spec_of(f))
         .collect();
-    // Refuse on the footer's row count before decoding a single page.
-    if let Some(max) = max_rows
-        && meta.num_rows() > 0
-        && meta.num_rows() as u64 > max
-    {
-        return Err(too_many_rows(max));
-    }
-
     // Owning row iterator: decodes one row group at a time.
     let iter = RowIter::from_file_into(Box::new(reader));
     let mut index = 0u64;
@@ -127,10 +126,21 @@ fn validate_column_ranges(
 ) -> Result<(), Refusal> {
     for row_group in metadata.row_groups() {
         for column in row_group.columns() {
-            let start = column
-                .dictionary_page_offset()
-                .unwrap_or_else(|| column.data_page_offset());
-            if start < 0 || column.compressed_size() < 0 {
+            let data_page = column.data_page_offset();
+            let dictionary_page = column.dictionary_page_offset();
+            let start = dictionary_page.unwrap_or(data_page);
+            let has_dictionary_encoding = column.encodings().any(|encoding| {
+                matches!(
+                    encoding,
+                    Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY
+                )
+            });
+            if start < 0
+                || data_page < 0
+                || column.compressed_size() < 0
+                || dictionary_page.is_some_and(|offset| offset >= data_page)
+                || has_dictionary_encoding && dictionary_page.is_none()
+            {
                 return Err(parse_refusal("invalid Parquet column range"));
             }
         }
