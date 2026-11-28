@@ -20,7 +20,10 @@ preserve-order = ["serde_json/preserve_order"]
 bytes = "1"
 csv = "1.4"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
+# JSON numbers are parsed from their original token and canonicalized exactly for
+# the byte-oriented Cell/key API; core defaults stay disabled.
+cmdrvl-core = { git = "https://github.com/cmdrvl/core", rev = "b586ad3", default-features = false }
 calamine = "0.38"
 # Same version calamine pulls in. Used only to measure XLSX decompressed size before calamine reads it.
 zip = { version = "9.0", default-features = false, features = ["deflate"] }

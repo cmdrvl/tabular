@@ -1,5 +1,7 @@
 //! JSONL / NDJSON reader. Headers are the union of object keys in first-seen
-//! order; rows that lack a later key are `Null`-padded.
+//! order; rows that lack a later key are `Null`-padded. Number values are
+//! captured as original JSON tokens, parsed by `cmdrvl-core::ExactDecimal`, and
+//! rendered as exact semantic bytes for the shared key/cell API.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -7,9 +9,10 @@ use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::Path;
 
 use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
-use serde_json::Value;
+use serde_json::{Value, value::RawValue};
 
-use crate::cell::canon_f64;
+use cmdrvl_core::exact_decimal::{DecimalError, ExactDecimal};
+
 use crate::detect::check_text_sample;
 use crate::refusal::{Refusal, RefusalCode};
 use crate::{Cell, Opened, Row, missing_headers};
@@ -141,7 +144,9 @@ pub(crate) fn open_bytes(bytes: Vec<u8>) -> Result<Opened, Refusal> {
 /// keeps that order only under `serde_json/preserve_order`, which is a switch for
 /// the whole build, so headers do not depend on it. A repeated key keeps its first
 /// position and its last value.
-struct OrderedObject(Vec<(String, Value)>);
+type JsonFields = Vec<(String, Box<RawValue>)>;
+
+struct OrderedObject(JsonFields);
 
 impl<'de> Deserialize<'de> for OrderedObject {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -154,9 +159,9 @@ impl<'de> Deserialize<'de> for OrderedObject {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut fields: Vec<(String, Value)> = Vec::new();
+                let mut fields: Vec<(String, Box<RawValue>)> = Vec::new();
                 let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-                while let Some((key, value)) = map.next_entry::<String, Value>()? {
+                while let Some((key, value)) = map.next_entry::<String, Box<RawValue>>()? {
                     match seen.get(&key) {
                         Some(&at) => fields[at].1 = value,
                         None => {
@@ -191,7 +196,7 @@ impl<R: BufRead> Lines<R> {
     }
 
     /// The next JSON object (blank lines skipped), or `None` at end of file.
-    fn next_object(&mut self) -> Result<Option<Vec<(String, Value)>>, Refusal> {
+    fn next_object(&mut self) -> Result<Option<JsonFields>, Refusal> {
         loop {
             self.buf.clear();
             let n = self
@@ -226,29 +231,51 @@ impl<R: BufRead> Lines<R> {
     }
 }
 
-fn json_cell(value: &Value, key: &str, row: u64) -> Result<Cell, Refusal> {
+fn json_cell(value: &RawValue, key: &str, row: u64) -> Result<Cell, Refusal> {
     let unsupported = |kind: &str| {
         Refusal::new(RefusalCode::EUnsupportedValue, "unsupported JSON value")
             .with("kind", kind)
             .with("column", key)
             .with("row", row)
     };
-    Ok(match value {
-        Value::Null => Cell::Null,
-        Value::Bool(b) => Cell::from_bytes(b.to_string()),
-        Value::String(s) => Cell::from_bytes(s.as_bytes()),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Cell::from_bytes(i.to_string())
-            } else if let Some(u) = n.as_u64() {
-                Cell::from_bytes(u.to_string())
-            } else {
-                match n.as_f64().and_then(canon_f64) {
-                    Some(text) => Cell::from_bytes(text),
-                    None => return Err(unsupported("non-finite number")),
-                }
-            }
-        }
-        Value::Array(_) | Value::Object(_) => return Err(unsupported("nested")),
-    })
+    let raw = value.get();
+    match raw.as_bytes().first().copied() {
+        Some(b'n') if raw == "null" => Ok(Cell::Null),
+        Some(b't') if raw == "true" => Ok(Cell::from_bytes("true")),
+        Some(b'f') if raw == "false" => Ok(Cell::from_bytes("false")),
+        Some(b'"') => serde_json::from_str::<String>(raw)
+            .map(|text| Cell::from_bytes(text.into_bytes()))
+            .map_err(|_| {
+                Refusal::new(RefusalCode::EJsonlParse, "invalid JSON string")
+                    .with("column", key)
+                    .with("row", row)
+            }),
+        Some(b'[') | Some(b'{') => Err(unsupported("nested")),
+        Some(_) => ExactDecimal::parse(raw)
+            .map(|number| Cell::from_bytes(number.to_key_string()))
+            .map_err(|error| decimal_refusal(error, key, row)),
+        None => Err(Refusal::new(RefusalCode::EJsonlParse, "invalid JSON value")
+            .with("column", key)
+            .with("row", row)),
+    }
+}
+
+fn decimal_refusal(error: DecimalError, key: &str, row: u64) -> Refusal {
+    Refusal::new(RefusalCode::EUnsupportedValue, "unsupported JSON number")
+        .with("kind", "number")
+        .with("reason", decimal_reason(error))
+        .with("column", key)
+        .with("row", row)
+}
+
+const fn decimal_reason(error: DecimalError) -> &'static str {
+    match error {
+        DecimalError::InvalidToken => "invalid_token",
+        DecimalError::TokenTooLong => "token_too_long",
+        DecimalError::ExponentOutOfRange => "exponent_out_of_range",
+        DecimalError::ScaleOutOfRange => "scale_out_of_range",
+        DecimalError::TooManySignificantDigits => "too_many_significant_digits",
+        DecimalError::ArithmeticOverflow => "arithmetic_overflow",
+        DecimalError::NegativeTolerance => "negative_tolerance",
+    }
 }

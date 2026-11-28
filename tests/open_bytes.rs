@@ -288,6 +288,25 @@ fn all_five_formats_have_identical_headers_cells_and_source_metadata() {
 }
 
 #[test]
+fn jsonl_exact_numbers_match_path_and_bytes_and_keep_strings_distinct() {
+    let bytes = br#"{"a":9007199254740992.1,"b":9007199254740992.2,"one":1,"one_point_zero":1.0,"text":"1.0"}
+"#
+    .to_vec();
+    let (_dir, path) = temp("exact.jsonl", &bytes);
+    let path_observation = path_observation(&path, &OpenOptions::default()).unwrap();
+    let bytes_observation =
+        bytes_observation(bytes, "exact.jsonl", &OpenOptions::default()).unwrap();
+    assert_eq!(path_observation, bytes_observation);
+    let rows = &path_observation.2;
+    let row = rows[0].as_ref().unwrap();
+    assert_eq!(row.cells[0].as_bytes(), b"9007199254740992.1");
+    assert_eq!(row.cells[1].as_bytes(), b"9007199254740992.2");
+    assert_eq!(row.cells[2].as_bytes(), b"1");
+    assert_eq!(row.cells[3].as_bytes(), b"1");
+    assert_eq!(row.cells[4].as_bytes(), b"1.0");
+}
+
+#[test]
 fn explicit_format_allows_a_missing_name_hint() {
     let bytes = std::fs::read(fx("sample.csv")).unwrap();
     let opts = OpenOptions {

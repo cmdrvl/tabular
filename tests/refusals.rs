@@ -417,6 +417,57 @@ fn jsonl_numbers_render_canonically() {
 }
 
 #[test]
+fn jsonl_numbers_use_exact_semantic_values_from_original_tokens() {
+    let (_d, p) = temp(
+        "exact.jsonl",
+        b"{\"a\":9007199254740992.1,\"b\":9007199254740992.2,\"one\":1,\"one_point_zero\":1.0,\"one_point_zeroes\":1.00,\"one_exp\":1e0,\"hundred\":100,\"hundred_exp\":1e2,\"negative_zero\":-0,\"text\":\"1.0\"}\n",
+    );
+    let (_, rows) = grid(&mut open(&p, &OpenOptions::default()).unwrap());
+    assert_eq!(
+        rows,
+        vec![vec![
+            t("9007199254740992.1"),
+            t("9007199254740992.2"),
+            t("1"),
+            t("1"),
+            t("1"),
+            t("1"),
+            t("100"),
+            t("100"),
+            t("0"),
+            t("1.0"),
+        ]]
+    );
+}
+
+#[test]
+fn jsonl_number_bound_errors_are_typed_and_value_free() {
+    let (_d, p) = temp("too-large.jsonl", b"{\"value\":1e1025}\n");
+    let r = open(&p, &OpenOptions::default()).unwrap_err();
+    assert_eq!(r.code, RefusalCode::EUnsupportedValue);
+    assert_eq!(r.context["kind"], json!("number"));
+    assert_eq!(r.context["row"], json!(1));
+    assert_eq!(r.context["column"], json!("value"));
+    assert_eq!(r.context["reason"], json!("exponent_out_of_range"));
+    assert_no_leak(&r, "1025");
+}
+
+#[test]
+fn jsonl_numbers_at_the_exact_exponent_boundary_do_not_fall_back_to_f64() {
+    let (_d, p) = temp("boundary.jsonl", b"{\"high\":1e1024,\"low\":1e-1024}\n");
+    let (_, rows) = grid(&mut open(&p, &OpenOptions::default()).unwrap());
+    let high = rows[0][0].as_bytes();
+    let low = rows[0][1].as_bytes();
+    assert_eq!(high.len(), 1025);
+    assert_eq!(high[0], b'1');
+    assert!(high[1..].iter().all(|digit| *digit == b'0'));
+    assert_eq!(low.len(), 1026);
+    assert_eq!(&low[..2], b"0.");
+    assert_eq!(low[low.len() - 1], b'1');
+    assert!(low[2..low.len() - 1].iter().all(|digit| *digit == b'0'));
+}
+
+#[test]
 fn jsonl_parse_errors_carry_line_numbers_not_content() {
     let (_d, p) = temp("b.jsonl", b"{\"a\":1}\n{\"a\":SECRETTOKEN}\n");
     let r = open(&p, &OpenOptions::default()).unwrap_err();

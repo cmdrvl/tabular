@@ -15,6 +15,8 @@
 //! loads the selected sheet, so memory is O(sheet), but its cells are still
 //! converted lazily, one row per `next()`.
 
+#![forbid(unsafe_code)]
+
 mod cell;
 mod csv_reader;
 mod detect;

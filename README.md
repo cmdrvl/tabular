@@ -35,8 +35,12 @@ let mut table = open_bytes(bytes, Some("data.csv"), &opts)?;
   crate's record API, no Arrow types exposed), and XLSX/XLS (via `calamine`).
 - Every cell is `Null` or non-empty `Text(bytes)`. Zero-length input is `Null` in
   every format. `NA`, `NULL` and similar are ordinary text; whitespace is kept.
-  Numbers and booleans render to one canonical text form (`2000.0` and `2000`
-  both become `2000`), so typed formats match a CSV of the same data.
+  JSONL numbers are captured from their original JSON tokens and parsed by the
+  bounded exact-decimal type in `cmdrvl-core`; mathematically equal spellings
+  (`1`, `1.0`, `1.00`, `1e0`) become the same canonical cell bytes, while
+  distinct values never collide. JSON strings remain strings, including text
+  such as `"1.0"`. Booleans render as `true` or `false`, and typed-format
+  numbers use their existing canonical text rules.
 - Excel workbooks with more than one sheet need an explicit sheet (name or
   0-based index); otherwise `E_AMBIGUOUS_SHEET` lists the sheets.
 
@@ -120,7 +124,8 @@ typed-refusal contract without filesystem access. `name_hint` is used only for
 extension-based format resolution; pass `None` when `opts.format` is explicit.
 It supports CSV, TSV, JSONL, Parquet and XLSX/XLS, including the same
 `max_bytes`, `max_rows` and `max_uncompressed_bytes` limits. JSONL number
-rendering is identical to `open`.
+canonicalization and exact-decimal refusals are identical between `open` and
+`open_bytes`.
 
 ## Known limits (v0)
 
