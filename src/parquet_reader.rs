@@ -72,6 +72,7 @@ fn open_reader<R: ChunkReader + 'static>(
     reader: SerializedFileReader<R>,
     max_rows: Option<u64>,
 ) -> Result<Opened, Refusal> {
+    validate_column_ranges(reader.metadata())?;
     let meta = reader.metadata().file_metadata();
     let headers: Vec<Vec<u8>> = meta
         .schema()
@@ -115,6 +116,26 @@ fn open_reader<R: ChunkReader + 'static>(
         delimiter: None,
         sheet: None,
     })
+}
+
+/// The parquet dependency's `ColumnChunkMetaData::byte_range` asserts that
+/// metadata offsets and compressed lengths are non-negative. Corrupted
+/// metadata must be a typed library refusal, not a process panic, so validate
+/// those inputs before constructing the lazy row iterator that calls it.
+fn validate_column_ranges(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+) -> Result<(), Refusal> {
+    for row_group in metadata.row_groups() {
+        for column in row_group.columns() {
+            let start = column
+                .dictionary_page_offset()
+                .unwrap_or_else(|| column.data_page_offset());
+            if start < 0 || column.compressed_size() < 0 {
+                return Err(parse_refusal("invalid Parquet column range"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cell(field: &Field, spec: ColSpec, column: &str, row: u64) -> Result<Cell, Refusal> {

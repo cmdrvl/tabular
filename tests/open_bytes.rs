@@ -33,6 +33,74 @@ fn bytes_observation(
     Ok((format, headers, rows, source))
 }
 
+const BD_TG9_CORRUPT_PARQUET: &str = "UEFSMRUEFRAVFEwVAhUAEgAACBwBAAAAAAAAABUAFRIVFiwVAhUQFQYVBhwYCAEAAAAAAAAAGAgBAAAAAAAAABYAKAgBAAAAAAAAABgIAQAAAAAAAAAREQAAAAkgAgAAAAIBAQIAFQQVCBUMTBUCFQASAAAEDJTdAAAVABUSFRYsFQIVEBUGFQYcGASUTQAAGASUTQAAFgAoBJRNAAAYBJRNAAAREQAAAAkgAgAAAAIBAQIAFQQZPDUAGAZzY2hlbWEVBAAVBCUCGAJpZAAVAiUCGAZjbG9zZWQlDExsAAAAFgIZHBksJgAcFQQZNQAGEBkYAmlkFQIWAha8ARbEASY4JggcGAgBAAAAAAAAABgIAQAAAAAAAAAWACgIAQAAAAAAAAAYCAEAAAAAAAAAEREAGSwVBBUAFQIAFQAVEBUCADwpBhkmAAIAAAAmABwVAhk1AAYQGRgGY2xvc2VkFQIWAhaUARabASb0ASbMARwYBJRNAAAYBJRNAAAWACgElE0AABgElE0AABERABksFQQVABUCABUAFRAVAgA8KQYZJgACAAAAFtACFgImCBbgAgAZHBgMQVJST1c6c2NoZW1hGPgBLy8vLy83QUFBQUFRQUFBQUFBQUtBQXdBQmdBRkFBZ0FDZ0FBQUFBQkJBQU1BQUFBQ0FBSUFBQUFCQUFJQUFBQUJBQUFBQUlBQUFCTUFBQUFCQUFBQU16Ly8vOEFBQUVJRUFBQUFDQUFBQUFFQUFBQUFBQUFBQVlBQUFCamJHOXpaV1FBQUFBQUJnQUlBQVlBQgAAQUFBQUFBQUFRQUJRQUNBQUdBQWNBREFBQUFCQUFFQUFBQUFBQUFRSVFBQUFBSEFBQUFBUUFBQUFBQUFBQUFnQUFBR2xrQUFBSUFBd0FDQUFIQUFnQUFBQUFBQUFCUUFBQUFBPT0AGCBwYXJxdWV0LWNwcC1hcnJvdyB2ZXJzaW9uIDI2LjAuMRksHAAAHAAAADUCAABQQVIx";
+
+fn decode_bd_tg9_fixture() -> Vec<u8> {
+    fn value(byte: u8) -> Option<u8> {
+        Some(match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+
+    let bytes = BD_TG9_CORRUPT_PARQUET.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let Some(&first) = chunk.first() else {
+            return Vec::new();
+        };
+        let Some(&second) = chunk.get(1) else {
+            return Vec::new();
+        };
+        let Some(a) = value(first) else {
+            return Vec::new();
+        };
+        let Some(b) = value(second) else {
+            return Vec::new();
+        };
+        decoded.push((a << 2) | (b >> 4));
+        if let Some(&third) = chunk.get(2)
+            && third != b'='
+        {
+            let Some(c) = value(third) else {
+                return Vec::new();
+            };
+            decoded.push((b << 4) | (c >> 2));
+            if let Some(&fourth) = chunk.get(3)
+                && fourth != b'='
+            {
+                let Some(d) = value(fourth) else {
+                    return Vec::new();
+                };
+                decoded.push((c << 6) | d);
+            }
+        }
+    }
+    decoded
+}
+
+#[test]
+fn bd_tg9_corrupt_parquet_is_a_typed_refusal_for_path_and_bytes() {
+    let bytes = decode_bd_tg9_fixture();
+    assert_eq!(bytes.len(), 753);
+
+    let bytes_refusal = open_bytes(
+        bytes.clone(),
+        Some("corrupt.parquet"),
+        &OpenOptions::default(),
+    )
+    .unwrap_err();
+    assert_eq!(bytes_refusal.code, RefusalCode::EParquetParse);
+
+    let (_dir, path) = temp("corrupt.parquet", &bytes);
+    let path_refusal = open(&path, &OpenOptions::default()).unwrap_err();
+    assert_eq!(path_refusal, bytes_refusal);
+}
+
 fn assert_path_bytes(path: &Path, name_hint: &str, opts: &OpenOptions) {
     let bytes = std::fs::read(path).unwrap();
     let path_result = path_observation(path, opts);
